@@ -457,6 +457,29 @@ def _render_generic_csv(req: "RenderRequest", df) -> tuple[bytes, str] | None:
     def _emit_fig(fig):
         return _emit(fig, req.format, dpi_val)
 
+    # Apply the cell's L/R/both side filter here too — generic CSVs
+    # need to honor the toggle just like the H-Walker-schema path.
+    inc_L = req.side in ("L", "both")
+    inc_R = req.side in ("R", "both")
+
+    def _side_of(col: str) -> str | None:
+        """Return 'L' / 'R' / None based on a heuristic on the column name."""
+        cl = col.lower()
+        if cl.startswith("l_") or "_l_" in cl or cl.startswith("left") or cl.endswith("_l"):
+            return "L"
+        if cl.startswith("r_") or "_r_" in cl or cl.startswith("right") or cl.endswith("_r"):
+            return "R"
+        return None
+
+    def _keep(col: str) -> bool:
+        s = _side_of(col)
+        if s == "L":
+            return inc_L
+        if s == "R":
+            return inc_R
+        # No side token — always keep (user may have single-channel data)
+        return True
+
     with _mpl.rc_context(_compose_rc(P)):
         if req.template in ("force", "force_avg"):
             # Find force-like columns; fallback to the first 1-2 plottable columns.
@@ -482,6 +505,15 @@ def _render_generic_csv(req: "RenderRequest", df) -> tuple[bytes, str] | None:
             else:
                 picks = plottable[:2]
 
+            # Respect the L/R side toggle
+            picks = [c for c in picks if _keep(c)]
+            if not picks:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Side filter '{req.side}' left no force columns to plot. "
+                           f"Detected columns: {[c for c in plottable if 'force' in c.lower()] or plottable[:4]}."
+                )
+
             fig, ax = _plt.subplots(figsize=(inch_w, inch_h), dpi=dpi_val)
             colors = ["#1E5F9E", "#9E3838", "#F09708"]
             for c, color in zip(picks, colors):
@@ -496,8 +528,8 @@ def _render_generic_csv(req: "RenderRequest", df) -> tuple[bytes, str] | None:
             return _emit_fig(fig)
 
         if req.template in ("debug_ts", "trials"):
-            # Small multiples: up to 4 rows
-            rows = plottable[:4]
+            # Small multiples: up to 4 rows — respect L/R filter
+            rows = [c for c in plottable if _keep(c)][:4]
             n = len(rows)
             fig, axes = _plt.subplots(n, 1, figsize=(inch_w, inch_h * max(1, n / 2)),
                                         dpi=dpi_val, sharex=True)
