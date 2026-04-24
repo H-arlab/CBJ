@@ -458,6 +458,45 @@ def stride_length(df: pd.DataFrame, res: AnalysisResult,
     L, R = L_zupt, R_zupt
     n = min(len(L), len(R)) if len(L) and len(R) else max(len(L), len(R))
 
+    # If we have literally nothing to report (ZUPT empty AND no treadmill
+    # belt speed configured), refuse to return zeros / fabricated means.
+    # Tells the user WHY — either the CSV has no L_Ax/L_Ay IMU velocity
+    # columns (so ZUPT can't run) or treadmill mode wasn't flagged.
+    if n == 0 and not (is_treadmill and belt_speed_ms):
+        has_ax = any(f"{s}_Ax" in df.columns and f"{s}_Ay" in df.columns
+                      for s in ("L", "R"))
+        if not has_ax and not belt_speed_ms:
+            reason = (
+                "Stride length cannot be computed: CSV has no L_Ax/L_Ay IMU "
+                "velocity columns (ZUPT needs global velocity), and the dataset "
+                "is not flagged as treadmill (TREADMILL toggle + belt_speed_ms)."
+            )
+        elif not has_ax:
+            reason = (
+                "Stride length needs L_Ax/L_Ay (IMU global velocity) for ZUPT, "
+                "or treadmill mode enabled. Neither condition met."
+            )
+        else:
+            reason = (
+                "ZUPT produced no valid stride lengths (likely missing heel-strikes "
+                "or all values rejected by sanity filters). Check the debug_ts "
+                "figure to verify the signal, or flag as treadmill with belt_speed_ms."
+            )
+        return {
+            "label": "Stride length (unavailable)",
+            "cols": ["stride_#", "L (m)", "R (m)", "asym (%)"],
+            "rows": [],
+            "summary": {"mean": ["—", "—", "—"]},
+            "meta": {
+                "n_strides": 0,
+                "mode": "unavailable",
+                "belt_speed_ms": belt_speed_ms,
+                "is_treadmill": bool(is_treadmill),
+                "warnings": [reason],
+                "unavailable_reason": reason,
+            },
+        }
+
     # Physiological warnings
     if mode == "zupt" and median_zupt is not None:
         if median_zupt < 0.15:
