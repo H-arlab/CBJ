@@ -369,3 +369,41 @@ export const fetchWindow = (dsId: string, req: WindowRequest) =>
     body: JSON.stringify(req),
   });
 
+
+
+// ============================================================
+// Sync alignment — multi-source experiments (Robot + Motion + Loadcell)
+// ============================================================
+
+export interface SyncEdgeResponse {
+  dataset_id: string;
+  sync_column: string | null;
+  first_falling_t_s: number | null;
+}
+
+export const fetchSyncEdge = (dsId: string) =>
+  json<SyncEdgeResponse>(`/api/sync/${dsId}/edge`);
+
+export interface AlignRequest {
+  dataset_ids: string[];
+  target_fs_hz?: number;
+  columns_per_source?: Record<string, string[]>;
+}
+
+export interface AlignResponse {
+  target_fs_hz: number;
+  t_min_s: number;
+  t_max_s: number;
+  n_grid_samples: number;
+  t_aligned_s: number[];
+  series: Record<string, Record<string, number[]>>;
+  sources: Array<{ dataset_id: string; columns: string[] }>;
+  sync_offsets_s: Record<string, number | null>;
+  warnings: string[];
+}
+
+export const alignSources = (req: AlignRequest) =>
+  json<AlignResponse>("/api/sync/align", {
+    method: "POST",
+    body: JSON.stringify(req),
+  });

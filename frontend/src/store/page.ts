@@ -55,11 +55,19 @@ export interface DatasetColumn {
   mappedManual?: boolean;
 }
 
+export type SourceKind = 'robot' | 'loadcell' | 'motion' | 'unknown';
+
 export interface Dataset {
   id: string;
   name: string;
   tag: string;
+  // Legacy column-based grouping (drives recipe picker)
   kind: 'force' | 'imu' | 'cop' | 'emg' | 'trials' | 'mixed';
+  // Phase 3: experimental source category. Filename-first (Robot* /
+  // Loadcell* / Motion*) with column-signature fallback.
+  source_kind?: SourceKind;
+  source_confidence?: number;       // 0..1
+  source_cues?: string[];           // human-readable matched cues
   rows: number;
   dur: string;
   hz: string;

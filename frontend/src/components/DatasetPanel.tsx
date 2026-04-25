@@ -80,6 +80,32 @@ export default function DatasetPanel() {
             onClick={() => setActive(d.id)}
           >
             <div className="ds-row1">
+              {d.source_kind && d.source_kind !== 'unknown' && (
+                <span
+                  className={`tag src-${d.source_kind}`}
+                  title={[
+                    `Detected as ${d.source_kind.toUpperCase()} `
+                      + `(confidence ${(d.source_confidence ?? 0).toFixed(2)})`,
+                    ...(d.source_cues || []).map((c) => `· ${c}`),
+                  ].join('\n')}
+                  style={{
+                    background:
+                      d.source_kind === 'robot'    ? 'rgba(240,151,8,.18)'
+                    : d.source_kind === 'motion'   ? 'rgba(167,139,250,.18)'
+                    : d.source_kind === 'loadcell' ? 'rgba(127,181,228,.18)'
+                    : undefined,
+                    color:
+                      d.source_kind === 'robot'    ? '#F09708'
+                    : d.source_kind === 'motion'   ? '#A78BFA'
+                    : d.source_kind === 'loadcell' ? '#7FB5E4'
+                    : undefined,
+                    border: '1px solid currentColor',
+                    fontWeight: 700,
+                  }}
+                >
+                  {d.source_kind.toUpperCase()}
+                </span>
+              )}
               <span className={`tag ${d.tag}`}>{d.tag}</span>
               <span className="name" title={d.name}>{d.name}</span>
               <button

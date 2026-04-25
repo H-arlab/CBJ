@@ -199,7 +199,7 @@ export default function GraphCell({ cell }: Props) {
         <input
           className="fig-cap-input"
           value={cell.title || ''}
-          placeholder="논문 캡션 — 이 그림이 뭘 보여주는지 한 줄로 (비워두면 figure 내부 제목 없음)"
+          placeholder="Figure caption — one sentence describing what this figure shows (leave empty to omit the inline title)"
           onChange={(e) => updateCell(cell.id, { title: e.target.value })}
         />
       </div>

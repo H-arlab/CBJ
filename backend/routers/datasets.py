@@ -232,6 +232,14 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
     except Exception:
         pass
     kind = _guess_kind(col_names)
+
+    # Phase 3 (multi-source experiment): also detect Robot / Loadcell /
+    # Motion source category from filename + column signature. The
+    # legacy `kind` (force/imu/cop/...) drives the recipe picker; the
+    # new `source_kind` drives source-specific compute / alignment.
+    from backend.services.source_kind import detect_source_kind
+    detection = detect_source_kind(file.filename, col_names)
+
     rows = len(df) if len(df) < 500 else None
     if rows is None:
         try:
@@ -265,6 +273,9 @@ async def upload(file: UploadFile = File(...)) -> dict[str, Any]:
         'name': file.filename,
         'tag': kind,
         'kind': kind,
+        'source_kind': detection.kind,
+        'source_confidence': detection.confidence,
+        'source_cues': detection.matched_cues,
         'rows': rows,
         'dur': f"{rows / hz:.1f}s" if hz else "—",
         'hz': f"{hz}Hz",
