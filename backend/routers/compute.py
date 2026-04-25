@@ -23,7 +23,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend.routers.analyze import analyze_cached
-from backend.routers.datasets import get_path
+from backend.services.dataset_registry import get_path
 from backend.services import compute_engine
 
 

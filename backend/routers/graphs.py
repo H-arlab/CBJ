@@ -107,7 +107,7 @@ def _render_multi_dataset(req: RenderRequest) -> tuple[bytes, str] | None:
         return None
 
     from backend.routers.analyze import analyze_cached
-    from backend.routers.datasets import get_path, _REGISTRY
+    from backend.services.dataset_registry import get_path, _REGISTRY
     from backend.services.compute_engine import resample_column
     import numpy as _np
     import pandas as _pd
@@ -316,7 +316,7 @@ def _render_real_data(req: RenderRequest) -> tuple[bytes, str] | None:
     import numpy as _np
 
     # Load the raw df for columns the analyzer doesn't pre-resample (joint angles, etc.)
-    from backend.routers.datasets import get_path
+    from backend.services.dataset_registry import get_path
     df_path = get_path(req.dataset_id)
     import pandas as _pd
     df = _pd.read_csv(df_path) if df_path else None

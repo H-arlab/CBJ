@@ -32,7 +32,7 @@ router = APIRouter(prefix="/api/sync", tags=["sync"])
 
 
 def _read_df(ds_id: str) -> pd.DataFrame:
-    from backend.routers.datasets import get_path  # lazy
+    from backend.services.dataset_registry import get_path  # lazy
     path = get_path(ds_id)
     if not path:
         raise HTTPException(status_code=404, detail=f"dataset '{ds_id}' not found")

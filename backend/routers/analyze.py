@@ -25,7 +25,7 @@ import numpy as np
 import pandas as pd
 from fastapi import APIRouter, HTTPException
 
-from backend.routers.datasets import get_path, _REGISTRY
+from backend.services.dataset_registry import get_path, _REGISTRY
 from backend.services.analysis_engine import run_full_analysis
 from tools.auto_analyzer.analyzer import result_to_dict, AnalysisResult
 

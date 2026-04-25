@@ -161,7 +161,7 @@ def _run_compute(cell: CellSpec) -> dict[str, Any] | None:
         return None
     from backend.routers.analyze import analyze_cached
     from backend.services import compute_engine
-    from backend.routers.datasets import get_path
+    from backend.services.dataset_registry import get_path
     import pandas as pd
     try:
         res, _ = analyze_cached(cell.dataset_id)
@@ -196,7 +196,7 @@ def _run_stat(cell: CellSpec) -> dict[str, Any] | None:
         # Column-based (pull values from dataset CSV)
         if cell.dataset_id:
             import pandas as pd
-            from backend.routers.datasets import get_path
+            from backend.services.dataset_registry import get_path
             path = get_path(cell.dataset_id)
             if not path:
                 return None
@@ -345,7 +345,7 @@ def _readme(req: BundleRequest, manifest: list[dict[str, Any]]) -> str:
 
 @router.post("/bundle")
 def bundle(req: BundleRequest):
-    from backend.routers.datasets import _REGISTRY
+    from backend.services.dataset_registry import _REGISTRY
 
     if not req.cells:
         raise HTTPException(status_code=400, detail="no cells provided")

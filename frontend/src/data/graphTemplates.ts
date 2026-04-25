@@ -44,16 +44,9 @@ export const GRAPH_TPLS: Record<string, GraphTemplate> = {
     yUnit: 'Asymmetry (%)', xUnit: 'Stride #',
     yTicks: ['10', '7.5', '5', '2.5', '0'], xTicks: ['1', '4', '7', '10', '14'],
   },
-  cop: {
-    ey: 'CoP · trajectory', title: 'Center of pressure path',
-    yUnit: 'AP (mm)', xUnit: 'ML (mm)',
-    yTicks: ['+50', '+25', '0', '−25', '−50'], xTicks: ['−40', '−20', '0', '+20', '+40'],
-  },
-  cv_bar: {
-    ey: 'Variability · CV', title: 'Coefficient of variation per trial',
-    yUnit: 'CV (%)', xUnit: 'Trial',
-    yTicks: ['8', '6', '4', '2', '0'], xTicks: ['T1', 'T2', 'T3', 'T4', 'T5'],
-  },
+  // (Removed: `cop` and `cv_bar`. Both have no real-data renderer
+  // yet — `cop` will return when the Motion-source force-plate
+  // pipeline lands, `cv_bar` when multi-trial structure ships.)
   trials: {
     ey: 'Trials overlay', title: 'Trial-by-trial overlay',
     yUnit: 'Normalized force', xUnit: 'Gait cycle (%)',

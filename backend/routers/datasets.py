@@ -34,10 +34,11 @@ router = APIRouter(prefix="/api/datasets", tags=["datasets"])
 _UPLOAD_DIR = Path(os.path.expanduser("~/.hw_graph/uploads"))
 _UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 _REGISTRY_PATH = _UPLOAD_DIR / "registry.json"
-# In-memory mirror (rebuilt from disk on startup)
-_REGISTRY: dict[str, dict[str, Any]] = {}
-# SHA256 → ds_id for O(1) dedup on upload
-_HASH_INDEX: dict[str, str] = {}
+
+# In-memory registry lives in a tiny shared module so other backends
+# (inspector, sync, future motion-source pipeline) can read paths
+# without dragging the FastAPI Form decorator into their import graph.
+from backend.services.dataset_registry import _REGISTRY, _HASH_INDEX  # noqa: E402
 
 
 def _save_registry() -> None:
