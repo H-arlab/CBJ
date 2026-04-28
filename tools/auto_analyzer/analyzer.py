@@ -107,6 +107,11 @@ class AnalysisResult:
     left_fatigue: float = 0.0
     right_fatigue: float = 0.0
 
+    # Sync window provenance (set only by analyze_file_windows)
+    sync_window_idx: int | None = None
+    sync_window_t_rise_s: float | None = None
+    sync_window_t_fall_s: float | None = None
+
 
 def _has_columns(df: pd.DataFrame, cols: list[str]) -> bool:
     """Check if all columns exist in the DataFrame."""
@@ -478,54 +483,27 @@ def _compute_stance_swing(df: pd.DataFrame, side: str,
     return stance_ratios, swing_ratios
 
 
-def analyze_file(filepath: str, analyses: list[str] = None) -> AnalysisResult:
+def _analyze_df(df: pd.DataFrame, fs: float, *, filename: str, filepath: str,
+                run_force: bool, run_imu: bool, run_gait: bool,
+                label_prefix: str = "") -> AnalysisResult:
+    """Per-DataFrame analysis core.
+
+    Used by both the legacy whole-CSV path (`analyze_file`) and the
+    sync-window path (`analyze_file_windows`). The `df` passed here
+    must already be the slice the caller wants analyzed — the function
+    does not look at any sync columns or apply any windowing logic.
     """
-    Run full analysis on a single CSV file.
-
-    Args:
-        filepath: Path to H-Walker CSV file.
-        analyses: List of analysis types to run. Options: 'force', 'imu', 'gait', 'all'.
-                  Default is ['all'].
-
-    Returns:
-        AnalysisResult with all computed metrics.
-    """
-    if analyses is None:
-        analyses = ['all']
-    run_all = 'all' in analyses
-    run_force = run_all or 'force' in analyses
-    run_imu = run_all or 'imu' in analyses
-    run_gait = run_all or 'gait' in analyses
-
-    # Load CSV using DataManager's logic
-    dm = DataManager()
-    lf = dm.load_csv(filepath)
-    if lf is None:
-        raise ValueError(f"Failed to load CSV: {filepath}")
-
-    df = lf.df
-    fs = DataManager.estimate_sample_rate(df)
-    # Defensive: malformed CSV (all-identical timestamps) can report
-    # fs=0, which would crash downstream division and integration.
-    # Fall back to a sentinel and surface the bad-data condition.
-    if not fs or fs <= 0:
-        raise ValueError(
-            f"Could not estimate sample rate for {filepath} (got {fs!r}). "
-            "CSV is likely missing a monotonic timestamp column."
-        )
-
     result = AnalysisResult(
-        filename=os.path.basename(filepath),
+        filename=filename,
         filepath=filepath,
         n_samples=len(df),
         duration_s=len(df) / fs,
         sample_rate=fs,
     )
 
-    print(f"  Loaded: {result.filename} ({result.n_samples} samples, "
+    print(f"  {label_prefix}{filename} ({result.n_samples} samples, "
           f"{result.duration_s:.1f}s, {fs:.1f} Hz)")
 
-    # Analyze each side
     for side, stride_attr, ft_attr, fp_attr in [
         ('L', 'left_stride', 'left_force_tracking', 'left_force_profile'),
         ('R', 'right_stride', 'right_force_tracking', 'right_force_profile'),
@@ -614,6 +592,119 @@ def analyze_file(filepath: str, analyses: list[str] = None) -> AnalysisResult:
         result.right_fatigue = _fatigue_index(rs.stride_times)
 
     return result
+
+
+def analyze_file(filepath: str, analyses: list[str] = None) -> AnalysisResult:
+    """Run full analysis on the entire CSV (legacy behavior).
+
+    For multi-trial recordings (one CSV with several sync windows),
+    use `analyze_file_windows()` instead — that returns one result
+    per window and is the correct unit for downstream aggregation.
+
+    Args:
+        filepath: Path to H-Walker CSV file.
+        analyses: List of analysis types to run. Options: 'force',
+                  'imu', 'gait', 'all'. Default is ['all'].
+
+    Returns:
+        AnalysisResult covering the whole CSV.
+    """
+    if analyses is None:
+        analyses = ['all']
+    run_all   = 'all'   in analyses
+    run_force = run_all or 'force' in analyses
+    run_imu   = run_all or 'imu'   in analyses
+    run_gait  = run_all or 'gait'  in analyses
+
+    dm = DataManager()
+    lf = dm.load_csv(filepath)
+    if lf is None:
+        raise ValueError(f"Failed to load CSV: {filepath}")
+
+    df = lf.df
+    fs = DataManager.estimate_sample_rate(df)
+    if not fs or fs <= 0:
+        raise ValueError(
+            f"Could not estimate sample rate for {filepath} (got {fs!r}). "
+            "CSV is likely missing a monotonic timestamp column."
+        )
+
+    return _analyze_df(
+        df, fs,
+        filename=os.path.basename(filepath),
+        filepath=filepath,
+        run_force=run_force, run_imu=run_imu, run_gait=run_gait,
+        label_prefix="Loaded: ",
+    )
+
+
+def analyze_file_windows(filepath: str, analyses: list[str] = None
+                          ) -> list[AnalysisResult]:
+    """Analyze each sync window of a recording independently.
+
+    A sync window = [rising-edge → falling-edge] in the firmware's
+    `Sync` column (operator pressed → released). Each window is one
+    trial in the experiment. Returns one AnalysisResult per window.
+
+    If the recording has no Sync column (or no detectable windows),
+    falls back to whole-CSV analysis and returns a single-element list
+    so callers can treat the no-sync case identically.
+    """
+    if analyses is None:
+        analyses = ['all']
+    run_all   = 'all'   in analyses
+    run_force = run_all or 'force' in analyses
+    run_imu   = run_all or 'imu'   in analyses
+    run_gait  = run_all or 'gait'  in analyses
+
+    dm = DataManager()
+    lf = dm.load_csv(filepath)
+    if lf is None:
+        raise ValueError(f"Failed to load CSV: {filepath}")
+
+    df = lf.df
+    fs = DataManager.estimate_sample_rate(df)
+    if not fs or fs <= 0:
+        raise ValueError(
+            f"Could not estimate sample rate for {filepath} (got {fs!r}). "
+            "CSV is likely missing a monotonic timestamp column."
+        )
+
+    # Lazy import keeps the analyzer importable in environments that
+    # don't have the FastAPI tree on the path.
+    from backend.services.sync_align import find_sync_windows
+    windows = find_sync_windows(df)
+    fname = os.path.basename(filepath)
+
+    if not windows:
+        # No sync information → treat whole recording as one trial.
+        return [_analyze_df(
+            df, fs,
+            filename=fname, filepath=filepath,
+            run_force=run_force, run_imu=run_imu, run_gait=run_gait,
+            label_prefix="No sync: ",
+        )]
+
+    results: list[AnalysisResult] = []
+    for win in windows:
+        slice_df = df.iloc[win.sample_rising:win.sample_falling].reset_index(drop=True)
+        if len(slice_df) < 10:
+            print(f"  Window {win.index}: only {len(slice_df)} samples — skipping")
+            continue
+        prefix = f"Window {win.index} ({win.duration_s:.1f}s) of "
+        res = _analyze_df(
+            slice_df, fs,
+            filename=fname, filepath=filepath,
+            run_force=run_force, run_imu=run_imu, run_gait=run_gait,
+            label_prefix=prefix,
+        )
+        # Tag the result with its window so downstream aggregation
+        # can pair it across sources.
+        res.sync_window_idx = win.index
+        res.sync_window_t_rise_s = win.rising_t_s
+        res.sync_window_t_fall_s = win.falling_t_s
+        results.append(res)
+    return results
 
 
 def compare_results(results: list[AnalysisResult]) -> dict:

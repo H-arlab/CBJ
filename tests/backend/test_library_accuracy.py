@@ -334,49 +334,47 @@ def test_compute_stance_pct_above_50(robot_dataset):
 
 def test_multi_source_pipeline_aligns_and_resamples(tmp_path, monkeypatch):
     """End-to-end: three CSVs in one experiment session land on a
-    single common time grid after sync alignment."""
+    single common time grid after rising-edge sync alignment."""
     from backend.services import dataset_registry as ds_mod
     from backend.routers.sync import align, AlignRequest
 
-    # Robot @ 111 Hz, sync starts HIGH then has its first FALLING
-    # edge at t = 0.5 s (then alternates, period 1 s).
-    robot = _synthetic_robot_csv(fs=111.0, duration_s=4.0)
-    # Replace the synthetic CSV's Sync (the helper uses a step
-    # function which has no falling edge) with a square wave whose
-    # first falling edge is at t=0.5.
-    t_r = robot["Time_ms"].to_numpy() / 1000.0
-    robot = robot.assign(Sync=np.where(
-        (((t_r - 0.5) % 1.0) >= 0.5) | (t_r < 0.5), 1.0, 0.0,
-    ))
+    def _sync_pulses(n, fs, windows):
+        out = np.zeros(n, dtype=float)
+        t = np.arange(n) / fs
+        for r, f in windows:
+            out[(t >= r) & (t < f)] = 1.0
+        return out
+
+    # Robot @ 111 Hz, sync rising at t=0.5, falling at t=4.0.
+    robot = _synthetic_robot_csv(fs=111.0, duration_s=6.0)
+    n_r = len(robot)
+    robot = robot.assign(Sync=_sync_pulses(n_r, 111.0, [(0.5, 4.0)]))
     robot_path = tmp_path / "Robot_pilot01.csv"
     robot.to_csv(robot_path, index=False)
 
-    # Motion @ 1 kHz with sync first falling edge at t = 0.7 s.
-    n_m = 4000
+    # Motion @ 1 kHz, sync rising at t=0.7, falling at t=4.2 (clock
+    # offset vs robot — anchored to the same physical event though).
+    n_m = 6000
     t_m = np.arange(n_m) / 1000.0
-    motion_sync = np.where(
-        (((t_m - 0.7) % 1.0) >= 0.5) | (t_m < 0.7), 1.0, 0.0,
-    )
     motion = pd.DataFrame({
         "Time": t_m,
-        "Sync": motion_sync,
+        "Sync": _sync_pulses(n_m, 1000.0, [(0.7, 4.2)]),
         "FP1_Fz": np.sin(2 * np.pi * t_m) * 200 + 600,
         "EMG_VL": np.cos(2 * np.pi * 4 * t_m) * 0.3,
     })
     motion_path = tmp_path / "Motion_pilot01.csv"
     motion.to_csv(motion_path, index=False)
 
-    # Loadcell calibration (no sync — that's expected; alignment
-    # routine should warn but not crash)
+    # Loadcell calibration (no sync — alignment routine should warn
+    # but continue with the synced sources).
     loadcell = pd.DataFrame({
         "time": np.linspace(0, 5, 50),
         "applied_N": np.linspace(0, 50, 50),
-        "robot_N": np.linspace(0, 51, 50),  # 2% drift
+        "robot_N": np.linspace(0, 51, 50),
     })
     loadcell_path = tmp_path / "Loadcell_calib_pilot01.csv"
     loadcell.to_csv(loadcell_path, index=False)
 
-    # Register all three
     ds_mod._REGISTRY.update({
         "ds_r": {"id": "ds_r", "name": robot_path.name,
                  "_path": str(robot_path), "source_kind": "robot"},
@@ -387,9 +385,10 @@ def test_multi_source_pipeline_aligns_and_resamples(tmp_path, monkeypatch):
     })
 
     try:
-        # Robot + Motion alignment
+        # Robot + Motion: align on first sync window.
         resp = align(AlignRequest(
             dataset_ids=["ds_r", "ds_m"],
+            window_idx=0,
             target_fs_hz=500.0,
             columns_per_source={
                 "ds_r": ["L_ActForce_N", "Sync"],
@@ -397,23 +396,28 @@ def test_multi_source_pipeline_aligns_and_resamples(tmp_path, monkeypatch):
             },
         ))
         assert resp.target_fs_hz == 500.0
+        assert resp.window_idx == 0
         assert resp.n_grid_samples > 100
         assert len(resp.t_aligned_s) == resp.n_grid_samples
         assert "ds_r" in resp.series and "ds_m" in resp.series
         assert "L_ActForce_N" in resp.series["ds_r"]
         assert "FP1_Fz" in resp.series["ds_m"]
         assert "EMG_VL" in resp.series["ds_m"]
-        # Sync edges anchored at 0
-        assert abs(resp.sync_offsets_s["ds_r"] - 0.5) < 0.02
-        assert abs(resp.sync_offsets_s["ds_m"] - 0.7) < 0.005
+        # Each source's window 0 was found and has positive duration
+        assert resp.sync_windows["ds_r"] is not None
+        assert resp.sync_windows["ds_m"] is not None
+        assert resp.sync_windows["ds_r"].duration_s > 1.0
+        assert resp.sync_windows["ds_m"].duration_s > 1.0
 
-        # Adding the loadcell (no sync) must succeed but warn.
+        # Adding the loadcell (no sync) must succeed for the synced
+        # pair, with a warning naming the loadcell.
         resp2 = align(AlignRequest(
             dataset_ids=["ds_r", "ds_m", "ds_l"],
+            window_idx=0,
             target_fs_hz=500.0,
         ))
-        # Some loadcell warning surfaces.
         assert any("ds_l" in w for w in resp2.warnings)
+        assert resp2.sync_windows["ds_l"] is None
     finally:
         for ds_id in ("ds_r", "ds_m", "ds_l"):
             ds_mod._REGISTRY.pop(ds_id, None)

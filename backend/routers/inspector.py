@@ -1,26 +1,22 @@
 """Per-sync inspector — MATLAB-style zoom/pan over raw CSV columns.
 
-The user's definition of `sync` (CLAUDE.md, declarative rules):
-    "디지털/아날로그 sync 신호의 한 사이클 — falling edge 후 rising
-     edge 부터 다시 falling edge 까지가 1 sync."
+User-confirmed sync definition (2026-04-25):
+    Rising edge = sync STARTS  (operator pressed button → trial begins)
+    Falling edge = sync ENDS   (operator released → trial ends)
+    Window = [rising, falling] half-open interval
 
-For the H-Walker firmware CSV the canonical source is the `Sync` column
-(see tools/graph_analyzer/data_manager.py CANONICAL_COLUMNS). It is a
-boolean-ish square wave: 0 / 1 transitions denote sync cycles.
+A recording can contain multiple windows; each window is one trial.
+This router exposes the windows for visualization + a generic
+zoom-window data-fetch.
 
-Two endpoints:
+Endpoints:
 
     GET /api/inspector/{ds_id}/syncs
-        Detect every sync cycle and return its [t_start, t_end] in
-        seconds. Empty list when the dataset has no Sync column.
+        Every [rising, falling] window in this dataset's Sync column.
 
     POST /api/inspector/{ds_id}/window
-        Body: { columns: [str], t_start: float, t_end: float,
-                max_points: int = 4000 }
-        Returns the requested raw columns inside the time window,
-        downsampled to at most max_points (LTTB-ish stride). This is
-        what the frontend re-fetches on every zoom / pan gesture so
-        we never ship the entire trial in one payload.
+        { columns, t_start, t_end, max_points } → downsampled traces
+        of the requested raw columns inside [t_start, t_end].
 """
 from __future__ import annotations
 
@@ -72,12 +68,13 @@ def _time_axis(df: pd.DataFrame) -> np.ndarray:
     return np.arange(len(df)) / fs
 
 
-def _detect_sync_cycles(sync: np.ndarray, t: np.ndarray) -> list[tuple[float, float]]:
-    """Find every full sync cycle = [falling → rising → next falling].
+def _detect_sync_windows(sync: np.ndarray, t: np.ndarray) -> list[tuple[float, float]]:
+    """Find every sync window = [rising-edge, falling-edge].
 
-    Sync is boolean-ish; we threshold at the midpoint. Each falling
-    edge starts a cycle, the next falling edge ends it. The very last
-    falling edge has no end, so its cycle is dropped.
+    Threshold at midpoint(min, max) so digital and analog sync both
+    work. For each rising edge, pair with the next falling edge.
+    A trailing rising edge with no closing falling edge is dropped
+    (incomplete trial — operator never released or recording stopped).
     """
     if sync.size == 0 or not np.isfinite(sync).any():
         return []
@@ -86,26 +83,25 @@ def _detect_sync_cycles(sync: np.ndarray, t: np.ndarray) -> list[tuple[float, fl
         return []
     lo, hi = float(np.nanmin(finite)), float(np.nanmax(finite))
     if hi - lo < 1e-9:
-        return []  # constant signal — no cycles
+        return []  # constant signal
     threshold = (lo + hi) / 2.0
-    high = sync > threshold
-
-    # Falling edges: high[i-1] && !high[i]
-    # We use np.diff on int(high) to find transitions.
-    h = high.astype(np.int8)
-    d = np.diff(h)
-    falling = np.where(d == -1)[0] + 1  # index right after the transition
-    if falling.size < 2:
+    high = (sync > threshold).astype(np.int8)
+    diff = np.diff(high)
+    rising  = np.where(diff ==  1)[0] + 1
+    falling = np.where(diff == -1)[0] + 1
+    if rising.size == 0 or falling.size == 0:
         return []
-    cycles: list[tuple[float, float]] = []
-    for i in range(falling.size - 1):
-        s, e = falling[i], falling[i + 1]
-        # Only return cycles that contain a rising edge in between
-        # (otherwise it's just a noise blip, not a real cycle).
-        between = h[s:e]
-        if np.any(between == 1):
-            cycles.append((float(t[s]), float(t[e])))
-    return cycles
+
+    windows: list[tuple[float, float]] = []
+    used_falling = 0
+    for r in rising:
+        cands = falling[(falling > r) & (np.arange(falling.size) >= used_falling)]
+        if cands.size == 0:
+            break
+        f = cands[0]
+        used_falling = int(np.where(falling == f)[0][0]) + 1
+        windows.append((float(t[r]), float(t[f])))
+    return windows
 
 
 # ============================================================
@@ -113,10 +109,10 @@ def _detect_sync_cycles(sync: np.ndarray, t: np.ndarray) -> list[tuple[float, fl
 # ============================================================
 
 class SyncBoundary(BaseModel):
-    index: int           # 0-based sync number
-    t_start: float
-    t_end: float
-    duration: float
+    index: int           # 0-based window number within recording
+    t_start: float       # rising-edge time (seconds)
+    t_end: float         # falling-edge time (seconds)
+    duration: float      # t_end − t_start
 
 
 class SyncsResponse(BaseModel):
@@ -124,6 +120,9 @@ class SyncsResponse(BaseModel):
     n_samples: int
     sample_rate_hz: Optional[float]
     cycles: list[SyncBoundary]
+    """Every [rising, falling] sync window in the recording. Field
+    name kept as `cycles` for frontend backwards-compat; the items
+    are windows in the rising→falling sense."""
 
 
 @router.get("/{ds_id}/syncs", response_model=SyncsResponse)
@@ -138,14 +137,14 @@ def list_syncs(ds_id: str) -> SyncsResponse:
         )
 
     sync = df["Sync"].to_numpy(dtype=float)
-    cycles = _detect_sync_cycles(sync, t)
+    windows = _detect_sync_windows(sync, t)
     return SyncsResponse(
         column="Sync",
         n_samples=len(df),
         sample_rate_hz=fs,
         cycles=[
             SyncBoundary(index=i, t_start=s, t_end=e, duration=e - s)
-            for i, (s, e) in enumerate(cycles)
+            for i, (s, e) in enumerate(windows)
         ],
     )
 

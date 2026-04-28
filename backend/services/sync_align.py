@@ -1,54 +1,67 @@
-"""Multi-source time alignment + upsampling onto a common grid.
+"""Multi-source sync alignment + window extraction + upsampling.
 
-User-stated requirement (verbatim from the conversation):
-    "sync가 안 맞는다니까 이거를 꼭 맞춰야 해 알지? upsampling
-     해야지 시간으로 맞추면"
+============================================================
+SYNC SIGNAL CONTRACT (user-confirmed 2026-04-25)
+============================================================
 
-i.e. **never** trust nominal sample rates to line up across sources;
-detect the first sync falling-edge in each CSV, set that to t = 0,
-then linearly interpolate every channel onto a single high-rate
-grid so per-stride windows can be sliced consistently across
-Robot / Motion / Loadcell sources.
+For an H-Walker recording, the operator presses a hardware sync
+button at the start of each task period and releases it at the end.
+The sync TTL is fanned out to:
 
-Key shapes:
+  - Robot DAQ → recorded as the `Sync` column
+  - Motion-capture system (Qualisys) → recorded as analog/trigger
+  - (Loadcell calibration is unsynced, recorded separately)
 
-    find_first_sync_falling_t(df, time_col=auto, sync_col=auto)
-        → float seconds (or None if no sync cycle found)
+Definition of one sync window:
 
-    align_to_t0(df, t0, time_col=auto)
-        → DataFrame with `t_aligned` column added (Time − t0, in seconds)
+      ___       ▔▔▔▔▔▔▔▔       ___       ▔▔▔▔▔▔       ___
+         ┕━ rise           fall ┙   ┕━ rise       fall ┙
+         ┕━━ window 1 (trial)  ━┙   ┕━ window 2 ━━━━━━┙
 
-    resample_to_grid(df, target_fs, t_min, t_max,
-                     time_col='t_aligned', value_cols=None)
-        → DataFrame with one row per grid sample, NaN-aware linear
-          interpolation, original column order preserved.
+  - Rising edge = sync STARTS  (button pressed → trial begins)
+  - Falling edge = sync ENDS   (button released → trial ends)
+  - Window = the half-open interval [t_rise, t_fall]
 
-    align_pair(df_a, df_b, target_fs)  → (a_grid, b_grid) on the
-        same uniform time axis, ready for cross-source per-stride
-        analysis.
+Analysis happens **inside** the window only. Data before the first
+rising edge (subject prep) or between windows (resting) is discarded.
 
-Uses the same falling-edge → rising-edge → falling-edge cycle
-definition as backend/routers/inspector.py (CLAUDE.md: "디지털/
-아날로그 sync 신호의 한 사이클").
+A single recording can contain N sync windows = N independent trials.
+============================================================
+
+Module shape:
+
+    SyncWindow                       — dataclass: rising_t_s, falling_t_s, ...
+    find_sync_windows(df)            — every [rise, fall] in the source
+    extract_window_slice(df, win)    — DataFrame slice for one window
+    align_to_window_start(df, win)   — rebase t_aligned so window start = 0
+    resample_to_grid(df, fs, t_min, t_max)
+                                     — NaN-aware linear upsampling
+    align_sources_on_window(...)     — N sources → common time grid
+
+Backwards-compat shims `find_first_sync_falling_t` and `align_pair`
+have been removed; callers must migrate to the window API. The earlier
+falling-edge anchoring was based on a misinterpretation of the user's
+spec and produced incorrect alignment.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-# ---------------------------------------------------------------
-# Column auto-detection helpers
-# ---------------------------------------------------------------
 
-_TIME_CANDIDATES_S    = ("Time_s", "time_s", "Timestamp", "Time", "time", "T", "t")
-_TIME_CANDIDATES_MS   = ("Time_ms", "time_ms")
-_SYNC_CANDIDATES      = ("Sync", "sync", "Trigger", "trigger", "TTL", "ttl")
+# ------------------------------------------------------------
+# Column auto-detection
+# ------------------------------------------------------------
+
+_TIME_CANDIDATES_S  = ("Time_s", "time_s", "Timestamp", "Time", "time", "T", "t")
+_TIME_CANDIDATES_MS = ("Time_ms", "time_ms")
+_SYNC_CANDIDATES    = ("Sync", "sync", "Trigger", "trigger", "TTL", "ttl")
 
 
 def _find_time_column(df: pd.DataFrame) -> tuple[Optional[str], float]:
-    """Return (column_name, scale_to_seconds). For Time_ms scale=1e-3."""
     for c in _TIME_CANDIDATES_S:
         if c in df.columns:
             return c, 1.0
@@ -66,79 +79,155 @@ def _find_sync_column(df: pd.DataFrame) -> Optional[str]:
 
 
 def _seconds_axis(df: pd.DataFrame) -> np.ndarray:
-    """Always-positive monotonically-increasing seconds axis. Falls
-    back to a sample-index axis at 1 kHz when no time column exists
-    (caller is responsible for using `align_to_t0` to anchor t=0)."""
+    """Monotonically-increasing seconds axis. Falls back to a 1 kHz
+    sample-index axis when no time column exists."""
     col, scale = _find_time_column(df)
     if col is None:
         return np.arange(len(df), dtype=np.float64) * 1e-3
     t = df[col].to_numpy(dtype=np.float64) * scale
-    # Some firmwares ship a wrapping ms counter — undo wraps so t is
-    # globally monotone.
-    if t.size > 1:
+    if t.size > 1 and np.any(np.diff(t) < 0):
+        # ms-counter wrap correction (rare but recoverable).
         d = np.diff(t)
-        if np.any(d < 0):
-            wraps = np.cumsum(np.where(d < 0, -d.min() if d.min() < 0 else 0, 0.0))
-            t = np.concatenate([[t[0]], t[1:] + wraps])
+        wraps = np.cumsum(np.where(d < 0, -d, 0.0))
+        t = np.concatenate([[t[0]], t[1:] + wraps])
     return t
 
 
-# ---------------------------------------------------------------
-# Sync cycle detection (falling-pair)
-# ---------------------------------------------------------------
+# ------------------------------------------------------------
+# SyncWindow dataclass
+# ------------------------------------------------------------
 
-def find_first_sync_falling_t(df: pd.DataFrame,
-                               sync_col: Optional[str] = None,
-                               ) -> Optional[float]:
-    """Time (in seconds) of the first falling edge of the sync signal,
-    or None if no falling edge exists.
+@dataclass(frozen=True)
+class SyncWindow:
+    """One [rising-edge, falling-edge] sync window in a recording.
 
-    "First falling edge" anchors t = 0 across sources per the user's
-    `sync` definition. Threshold midpoint between min and max so the
-    routine handles both digital (0/1) and analog (TTL ramp) traces.
+    All times are in seconds, in the source's own time axis (i.e.
+    the values straight out of the time column, before any cross-
+    source alignment).
+    """
+    index: int                 # 0-based ordering within the recording
+    rising_t_s: float
+    falling_t_s: float
+    sample_rising: int         # row index (0-based) of the rising edge
+    sample_falling: int        # row index of the falling edge
+
+    @property
+    def duration_s(self) -> float:
+        return self.falling_t_s - self.rising_t_s
+
+    @property
+    def n_samples(self) -> int:
+        return self.sample_falling - self.sample_rising
+
+    def as_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "rising_t_s": self.rising_t_s,
+            "falling_t_s": self.falling_t_s,
+            "duration_s": self.duration_s,
+            "n_samples": self.n_samples,
+        }
+
+
+# ------------------------------------------------------------
+# Window detection
+# ------------------------------------------------------------
+
+def find_sync_windows(df: pd.DataFrame,
+                      sync_col: Optional[str] = None,
+                      ) -> list[SyncWindow]:
+    """Return every rising→falling sync window in the DataFrame.
+
+    Algorithm:
+      1. Threshold the sync signal at midpoint(min, max) so digital
+         (0/1) and analog (TTL ramp) signals both work.
+      2. Find all rising-edge sample indices.
+      3. For each rising edge, find the **next** falling-edge sample.
+      4. Emit the [rising, falling] pair as one SyncWindow.
+
+    A trailing rising edge with no closing falling edge is dropped
+    (incomplete window — the operator never released the button or
+    the recording stopped mid-trial).
     """
     sync_col = sync_col or _find_sync_column(df)
-    if sync_col is None:
-        return None
+    if sync_col is None or sync_col not in df.columns:
+        return []
+
     t = _seconds_axis(df)
     s = df[sync_col].to_numpy(dtype=np.float64)
-    finite = np.isfinite(s)
-    if finite.sum() < 4:
-        return None
-    s = s[finite]
-    t = t[finite]
-    lo, hi = float(np.min(s)), float(np.max(s))
+    finite_mask = np.isfinite(s)
+    if finite_mask.sum() < 4:
+        return []
+
+    s_finite = s[finite_mask]
+    t_finite = t[finite_mask]
+    finite_idx = np.where(finite_mask)[0]      # mapping back to original rows
+
+    lo, hi = float(np.min(s_finite)), float(np.max(s_finite))
     if hi - lo < 1e-9:
-        return None  # constant — no edges
+        return []   # constant signal → no edges
+
     threshold = (lo + hi) / 2.0
-    high = (s > threshold).astype(np.int8)
+    high = (s_finite > threshold).astype(np.int8)
     diff = np.diff(high)
-    falling_idx = np.where(diff == -1)[0] + 1
-    if falling_idx.size == 0:
-        return None
-    return float(t[falling_idx[0]])
+    rising_local  = np.where(diff ==  1)[0] + 1
+    falling_local = np.where(diff == -1)[0] + 1
+    if rising_local.size == 0 or falling_local.size == 0:
+        return []
+
+    windows: list[SyncWindow] = []
+    used_falling = 0
+    for r_local in rising_local:
+        # First falling edge AFTER this rising edge that we haven't
+        # already paired with a previous rising edge.
+        cands = falling_local[(falling_local > r_local)
+                              & (np.arange(falling_local.size) >= used_falling)]
+        if cands.size == 0:
+            break
+        f_local = cands[0]
+        used_falling = int(np.where(falling_local == f_local)[0][0]) + 1
+        windows.append(SyncWindow(
+            index=len(windows),
+            rising_t_s=float(t_finite[r_local]),
+            falling_t_s=float(t_finite[f_local]),
+            sample_rising=int(finite_idx[r_local]),
+            sample_falling=int(finite_idx[f_local]),
+        ))
+    return windows
 
 
-# ---------------------------------------------------------------
-# Alignment
-# ---------------------------------------------------------------
+# ------------------------------------------------------------
+# Window slicing + rebasing
+# ------------------------------------------------------------
 
-def align_to_t0(df: pd.DataFrame,
-                 t0: Optional[float] = None,
-                 ) -> pd.DataFrame:
-    """Add a `t_aligned` column to df (in seconds), where t_aligned = 0
-    at the first sync falling edge. If t0 is None, detect from this
-    DataFrame's own sync signal. If still None (no sync) we just
-    return df with t_aligned = raw seconds axis (caller will see
-    that the offset wasn't determined and can warn the user)."""
-    if t0 is None:
-        t0 = find_first_sync_falling_t(df)
-        if t0 is None:
-            t0 = 0.0
+def extract_window_slice(df: pd.DataFrame,
+                          window: SyncWindow,
+                          ) -> pd.DataFrame:
+    """DataFrame slice corresponding to one sync window. Adds a
+    `t_window_s` column rebased so window start = 0."""
+    sub = df.iloc[window.sample_rising:window.sample_falling].copy()
+    if sub.empty:
+        return sub
+    raw_t = _seconds_axis(df)[window.sample_rising:window.sample_falling]
+    sub["t_window_s"] = raw_t - window.rising_t_s
+    return sub.reset_index(drop=True)
+
+
+def align_to_window_start(df: pd.DataFrame,
+                           window: SyncWindow,
+                           ) -> pd.DataFrame:
+    """Add a `t_aligned` column to df, where t_aligned = 0 at the
+    window's rising edge. The full df is preserved (not sliced).
+    Use this when you need to keep pre/post-window samples for
+    visualization or quality-check overlays."""
     out = df.copy()
-    out["t_aligned"] = _seconds_axis(df) - t0
+    out["t_aligned"] = _seconds_axis(df) - window.rising_t_s
     return out
 
+
+# ------------------------------------------------------------
+# Uniform-grid resampling (NaN-aware linear interpolation)
+# ------------------------------------------------------------
 
 def resample_to_grid(df: pd.DataFrame,
                       target_fs: float,
@@ -147,14 +236,15 @@ def resample_to_grid(df: pd.DataFrame,
                       time_col: str = "t_aligned",
                       value_cols: Optional[list[str]] = None,
                       ) -> pd.DataFrame:
-    """Linear-interpolate `value_cols` (default: every numeric column
-    except the time axis) onto a uniform grid at `target_fs`."""
+    """Linearly interpolate `value_cols` onto a uniform grid at
+    `target_fs` Hz. Returns NaN for grid samples outside the source's
+    own range so per-stride logic upstream can skip the gap."""
     if target_fs <= 0:
         raise ValueError("target_fs must be > 0")
     if t_max <= t_min:
         raise ValueError("t_max must be > t_min")
     if time_col not in df.columns:
-        raise KeyError(f"time column '{time_col}' missing from DataFrame")
+        raise KeyError(f"time column '{time_col}' missing")
 
     t_src = df[time_col].to_numpy(dtype=np.float64)
     n_grid = int(np.floor((t_max - t_min) * target_fs)) + 1
@@ -164,71 +254,116 @@ def resample_to_grid(df: pd.DataFrame,
         value_cols = [c for c in df.columns
                       if c != time_col and pd.api.types.is_numeric_dtype(df[c])]
 
-    out: dict[str, np.ndarray] = {time_col: t_grid}
-    # Sort source by time once — interp requires monotone xp.
     order = np.argsort(t_src)
     t_sorted = t_src[order]
-    # Drop duplicate timestamps (linear interp would zigzag otherwise).
     uniq_mask = np.concatenate([[True], np.diff(t_sorted) > 0])
     t_uniq = t_sorted[uniq_mask]
 
+    out: dict[str, np.ndarray] = {time_col: t_grid}
     for col in value_cols:
         y = df[col].to_numpy(dtype=np.float64)[order][uniq_mask]
-        # Interp returns left/right boundary value outside [t_uniq];
-        # we want NaN there so per-stride windows don't pull garbage
-        # from before/after the recorded trial.
-        gridded = np.interp(t_grid, t_uniq, y, left=np.nan, right=np.nan)
-        out[col] = gridded
-
+        out[col] = np.interp(t_grid, t_uniq, y, left=np.nan, right=np.nan)
     return pd.DataFrame(out)
 
 
-def align_pair(df_a: pd.DataFrame, df_b: pd.DataFrame,
-                target_fs: float = 1000.0,
-                ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    """Align two CSVs onto a single uniform time grid at `target_fs`.
+# ------------------------------------------------------------
+# Multi-source alignment on a chosen sync window
+# ------------------------------------------------------------
 
-    Each DataFrame is anchored at its own first sync-falling edge
-    (so two sessions recorded with independent clocks line up at
-    that physical event). The grid spans the maximum overlap window
-    of the two sources.
+@dataclass
+class AlignedSources:
+    """Result of aligning N sources on a single sync-window index."""
+    target_fs_hz: float
+    t_min_s: float
+    t_max_s: float
+    n_grid_samples: int
+    grids: dict[str, pd.DataFrame] = field(default_factory=dict)
+    """{source_id: gridded_dataframe with t_aligned + numeric channels}"""
+    window_per_source: dict[str, Optional[SyncWindow]] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
-    Returns (a_gridded, b_gridded, info) where `info` carries the
-    per-source t0 in original seconds, the chosen grid range, and
-    any warnings (e.g. "no sync edge found in B — alignment may be
-    off by the source's recording offset").
+
+def align_sources_on_window(
+    sources: dict[str, pd.DataFrame],
+    window_idx: int = 0,
+    target_fs: float = 1000.0,
+    columns_per_source: Optional[dict[str, list[str]]] = None,
+) -> AlignedSources:
+    """Align several sources on the **same sync-window index** within
+    each source.
+
+    Per-source pipeline:
+      1. Detect that source's sync windows.
+      2. Pick the window at `window_idx` (0 = first trial in recording).
+      3. Anchor t_aligned = 0 at that window's rising edge.
+      4. Resample to a common grid spanning the overlap of all
+         source's t_aligned ranges.
+
+    A source missing the requested window (e.g. Loadcell calibration
+    has no Sync) is skipped with a warning; its grid is omitted from
+    the result. Callers should check `warnings` and either retry with
+    a different window or treat that source as unaligned.
     """
-    info: dict = {"warnings": []}
+    if not sources:
+        raise ValueError("at least one source required")
 
-    t0_a = find_first_sync_falling_t(df_a)
-    t0_b = find_first_sync_falling_t(df_b)
-    if t0_a is None:
-        info["warnings"].append("no sync falling-edge in source A — anchored at 0")
-    if t0_b is None:
-        info["warnings"].append("no sync falling-edge in source B — anchored at 0")
+    warnings: list[str] = []
+    aligned: dict[str, pd.DataFrame] = {}
+    win_per_src: dict[str, Optional[SyncWindow]] = {}
 
-    a = align_to_t0(df_a, t0_a)
-    b = align_to_t0(df_b, t0_b)
+    for src_id, df in sources.items():
+        windows = find_sync_windows(df)
+        if not windows:
+            warnings.append(
+                f"{src_id}: no sync window found — source skipped from alignment"
+            )
+            win_per_src[src_id] = None
+            continue
+        if window_idx >= len(windows):
+            warnings.append(
+                f"{src_id}: requested window {window_idx} but only "
+                f"{len(windows)} present — source skipped"
+            )
+            win_per_src[src_id] = None
+            continue
+        win = windows[window_idx]
+        aligned[src_id] = align_to_window_start(df, win)
+        win_per_src[src_id] = win
 
-    info["t0_a_s"] = float(t0_a) if t0_a is not None else None
-    info["t0_b_s"] = float(t0_b) if t0_b is not None else None
+    if not aligned:
+        raise ValueError(
+            "no source had the requested sync window — "
+            "check sync TTL routing across the lab"
+        )
 
-    # Common overlap window (after alignment both axes share t=0 at sync).
-    a_t = a["t_aligned"].to_numpy()
-    b_t = b["t_aligned"].to_numpy()
-    t_min = float(max(a_t.min(), b_t.min()))
-    t_max = float(min(a_t.max(), b_t.max()))
+    # Grid range = inside the sync window only (t = 0 at rising edge,
+    # t = min(window_duration) at the earliest falling edge across
+    # sources). Pre/post-window data is preserved in `aligned` and is
+    # available for visualization but not part of the analysis grid.
+    t_min = 0.0
+    durations = [w.duration_s for w in win_per_src.values() if w is not None]
+    if not durations:
+        raise ValueError("no aligned source has a valid sync window")
+    t_max = float(min(durations))
     if t_max <= t_min:
         raise ValueError(
-            f"sources have no temporal overlap after sync alignment: "
-            f"A=[{a_t.min():.3f}, {a_t.max():.3f}], "
-            f"B=[{b_t.min():.3f}, {b_t.max():.3f}]"
+            f"sync window has zero or negative duration ({t_max:.3f}s)"
         )
-    info["t_min_s"] = t_min
-    info["t_max_s"] = t_max
-    info["target_fs_hz"] = target_fs
 
-    a_grid = resample_to_grid(a, target_fs, t_min, t_max)
-    b_grid = resample_to_grid(b, target_fs, t_min, t_max)
-    info["n_grid_samples"] = len(a_grid)
-    return a_grid, b_grid, info
+    grids: dict[str, pd.DataFrame] = {}
+    for src_id, df_aligned in aligned.items():
+        cols = (columns_per_source or {}).get(src_id)
+        grids[src_id] = resample_to_grid(
+            df_aligned, target_fs, t_min, t_max,
+            time_col="t_aligned", value_cols=cols,
+        )
+
+    return AlignedSources(
+        target_fs_hz=target_fs,
+        t_min_s=float(t_min),
+        t_max_s=float(t_max),
+        n_grid_samples=len(next(iter(grids.values()))),
+        grids=grids,
+        window_per_source=win_per_src,
+        warnings=warnings,
+    )

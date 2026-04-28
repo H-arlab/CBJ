@@ -261,8 +261,8 @@ curl http://localhost:8000/api/claude/health
 
 ## 📌 기억해야 할 선언적 규칙
 
-- **🚫 절대 mock / placeholder 데이터를 UI 에 띄우지 마라.** 사용자 1순위 분노 트리거. 데이터셋 미바인드 상태에서는 빈 상태 (axes only + "Bind a CSV" 메시지) — fake bezier curve / "n strides=14" / "112 spm" 같은 placeholder 절대 금지. 컴포넌트는 항상 실제 백엔드 응답만 렌더해야 한다. 정책 위반 회귀 막는 테스트: `tests/backend/test_llm_tool_schema.py::test_add_graph_cell_enum_excludes_removed`.
-- **🔁 sync 의 정의 (사용자 명시)**: "디지털/아날로그 sync 신호의 한 사이클" — falling edge 후 rising edge 부터 다시 falling edge 까지가 1 sync. heel-strike 와 다른 개념. 사용자가 "한 싱크 한 싱크 잘라달라" 하면 sync signal 의 매 cycle 마다 데이터 구간을 잘라서 보여주라는 의미. (per-sync crop / inspector 는 진행 중 feature.)
+- **🚫 절대 mock / placeholder 데이터를 UI 에 띄우지 마라.** 사용자 1순위 분노 트리거. 데이터셋 미바인드 상태에서는 빈 상태 (axes only + "Bind a CSV" 메시지) — fake bezier curve / "n strides=14" / "112 spm" 같은 placeholder 절대 금지. 컴포넌트는 항상 실제 백엔드 응답만 렌더해야 한다. 정책 위반 회귀 막는 테스트: `tests/backend/test_no_mock_data.py`.
+- **🔁 sync 의 정의 (사용자 명시 2026-04-25)**: 한 sync window = `[rising edge, falling edge]` half-open 구간. **rising edge 가 sync START** (operator 가 버튼 누름 → trial 시작), **falling edge 가 sync END** (operator 가 버튼 뗌 → trial 끝). 한 recording 안에 N 개 window = N 개 trial. 분석은 **window 안의 데이터만** 사용 (window 밖은 prep / rest 구간이라 제외). heel-strike 와 다른 개념. 옛 문서가 "falling-rising-falling 한 cycle" 로 잘못 적었었음 — 정정됨. 구현: `backend/services/sync_align.py:find_sync_windows` / `extract_window_slice` / `align_sources_on_window`, `backend/routers/inspector.py:_detect_sync_windows`, `tools/auto_analyzer/analyzer.py:analyze_file_windows`. 회귀: `tests/backend/test_sync_align.py`, `test_inspector.py`, `test_trial_pairing.py`.
 - **삭제된 그래프 (다시 추가 금지 without 명시 동의)**: `peak_box` (asymmetry + per_stride table 로 충분), `debug_ts` (clutter + 줌 안 됨). 사용자가 직접 "다시 넣어줘" 하기 전엔 부활 금지.
 - **절대 디자인 팔레트 바꾸지 마라.** `#F09708` / `#00FFB2` / `#0B0E2E` 는 브랜드 정체성.
 - **절대 Tailwind 다시 도입하지 마라.** 수동 CSS 로 정리된 상태.

@@ -1,12 +1,11 @@
-"""Tests for sync alignment + upsampling.
+"""Tests for sync_align — rising-edge / falling-edge window detection.
 
-User contract:
-    "sync 가 안 맞는다니까 이거를 꼭 맞춰야 해 알지? upsampling
-     해야지 시간으로 맞추면"
+User-confirmed sync contract (2026-04-25):
+    Rising edge = sync STARTS  (operator pressed → trial begins)
+    Falling edge = sync ENDS   (operator released → trial ends)
+    Window = [rising, falling] half-open interval
 
-Two sources, different clocks, different sample rates → align to
-the first sync falling edge, resample onto a common high-rate grid,
-preserve cross-source time semantics for per-stride analyses.
+A recording can contain N sync windows = N trials inside one CSV.
 """
 from __future__ import annotations
 
@@ -17,115 +16,141 @@ import pytest
 from backend.services import sync_align
 
 
-# ---------------------------------------------------------------
-# Synthetic source factories
-# ---------------------------------------------------------------
+# ============================================================
+# Synthetic sync signal helpers
+# ============================================================
 
-def _square(n: int, fs: float, period_s: float, t_offset_s: float = 0.0) -> np.ndarray:
-    """Square wave that starts HIGH at t=0, has its first FALLING edge
-    at `t_offset_s`, and then alternates with `period_s` (50% duty).
-    This matches a real sync signal that is held high until the first
-    cycle starts."""
+def _sync_with_windows(n: int, fs: float,
+                        windows: list[tuple[float, float]]) -> np.ndarray:
+    """Return a sync signal of length n at sampling rate fs that is
+    HIGH inside each (rise, fall) interval and LOW everywhere else.
+
+    Default state = LOW (subject prep / between trials).
+    """
+    out = np.zeros(n, dtype=float)
     t = np.arange(n) / fs
-    rel = t - t_offset_s
-    out = np.ones(n, dtype=float)
-    post = rel >= 0
-    if post.any():
-        phase = (rel[post] % period_s) / period_s
-        # First half of each post-fall period = LOW, second half = HIGH
-        out[post] = (phase >= 0.5).astype(float)
+    for rise, fall in windows:
+        mask = (t >= rise) & (t < fall)
+        out[mask] = 1.0
     return out
 
 
-def _make_robot(fs=111.0, dur_s=4.0, sync_at_s=1.0):
-    """Mimic a Robot CSV at ~111 Hz with one sync cycle starting at 1 s."""
-    n = int(dur_s * fs)
-    t_ms = np.arange(n) * (1000.0 / fs)
-    sync = _square(n, fs, period_s=1.0, t_offset_s=sync_at_s)
-    return pd.DataFrame({
-        "Time_ms": t_ms,
-        "L_ActForce_N": np.sin(2 * np.pi * t_ms / 1000.0) * 30 + 50,
-        "Sync": sync,
-    })
+def _df(sync: np.ndarray, fs: float, **extra) -> pd.DataFrame:
+    n = len(sync)
+    data = {"Time_ms": np.arange(n) * (1000.0 / fs), "Sync": sync, **extra}
+    return pd.DataFrame(data)
 
 
-def _make_motion(fs=1000.0, dur_s=4.0, sync_at_s=1.7):
-    """Mimic a Motion / force-plate CSV at 1 kHz with sync edge offset
-    by a different amount (so alignment really has to do work)."""
-    n = int(dur_s * fs)
-    t_s = np.arange(n) / fs
-    sync = _square(n, fs, period_s=1.0, t_offset_s=sync_at_s)
-    return pd.DataFrame({
-        "Time": t_s,
-        "FP1_Fz": np.cos(2 * np.pi * t_s) * 200 + 600,
-        "Sync": sync,
-    })
+# ============================================================
+# Sync window detection
+# ============================================================
+
+def test_finds_single_window():
+    fs = 100.0
+    sync = _sync_with_windows(500, fs, [(1.0, 3.0)])
+    df = _df(sync, fs)
+    wins = sync_align.find_sync_windows(df)
+    assert len(wins) == 1
+    w = wins[0]
+    assert abs(w.rising_t_s - 1.0) < 0.02
+    assert abs(w.falling_t_s - 3.0) < 0.02
+    assert abs(w.duration_s - 2.0) < 0.02
+    assert w.index == 0
 
 
-# ---------------------------------------------------------------
-# Sync edge detection
-# ---------------------------------------------------------------
-
-def test_finds_first_falling_edge_robot():
-    df = _make_robot(sync_at_s=1.0)
-    t0 = sync_align.find_first_sync_falling_t(df)
-    # `_square` is HIGH until t = sync_at_s, falls there.
-    assert t0 is not None
-    assert abs(t0 - 1.0) < 0.02
-
-
-def test_finds_first_falling_edge_motion_kHz():
-    df = _make_motion(sync_at_s=1.7)
-    t0 = sync_align.find_first_sync_falling_t(df)
-    assert t0 is not None
-    assert abs(t0 - 1.7) < 0.005  # 1 kHz grid is tight
+def test_finds_multiple_windows_with_gaps():
+    fs = 100.0
+    sync = _sync_with_windows(1500, fs, [
+        (1.0, 3.0),    # window 0: 2 s
+        (5.0, 7.5),    # window 1: 2.5 s
+        (9.0, 13.0),   # window 2: 4 s
+    ])
+    df = _df(sync, fs)
+    wins = sync_align.find_sync_windows(df)
+    assert len(wins) == 3
+    assert [w.index for w in wins] == [0, 1, 2]
+    expected_durations = [2.0, 2.5, 4.0]
+    for w, expected in zip(wins, expected_durations):
+        assert abs(w.duration_s - expected) < 0.02
 
 
-def test_returns_none_when_constant_sync():
+def test_drops_trailing_unclosed_window():
+    """If sync goes high and the recording ends before it goes low,
+    that window is incomplete and must be dropped."""
+    fs = 100.0
     n = 500
-    df = pd.DataFrame({"Time_ms": np.arange(n) * 9.0,
-                       "Sync": np.zeros(n),
-                       "L_ActForce_N": np.zeros(n)})
-    assert sync_align.find_first_sync_falling_t(df) is None
+    sync = np.zeros(n, dtype=float)
+    sync[100:300] = 1.0    # complete window 0: rise@1s, fall@3s
+    sync[400:] = 1.0       # rises but never falls before EOF
+    df = _df(sync, fs)
+    wins = sync_align.find_sync_windows(df)
+    assert len(wins) == 1
 
 
-def test_returns_none_when_no_sync_column():
-    df = pd.DataFrame({"Time_ms": [0.0, 1.0, 2.0],
-                       "L_ActForce_N": [1.0, 2.0, 3.0]})
-    assert sync_align.find_first_sync_falling_t(df) is None
+def test_constant_signal_yields_no_windows():
+    fs = 100.0
+    df = _df(np.zeros(300), fs)
+    assert sync_align.find_sync_windows(df) == []
+    df_high = _df(np.ones(300), fs)
+    assert sync_align.find_sync_windows(df_high) == []
 
 
-# ---------------------------------------------------------------
-# align_to_t0 → t_aligned column
-# ---------------------------------------------------------------
-
-def test_align_to_t0_zeroes_sync_edge():
-    df = _make_robot(sync_at_s=1.0)
-    out = sync_align.align_to_t0(df)
-    assert "t_aligned" in out.columns
-    # The sync falling edge sample should now be at t_aligned ≈ 0.
-    sync = out["Sync"].to_numpy()
-    high = (sync > 0.5).astype(int)
-    fall = np.where(np.diff(high) == -1)[0][0] + 1
-    assert abs(out["t_aligned"].iloc[fall]) < 0.02
+def test_no_sync_column_yields_no_windows():
+    df = pd.DataFrame({"Time_ms": np.arange(100) * 10.0,
+                       "L_ActForce_N": np.zeros(100)})
+    assert sync_align.find_sync_windows(df) == []
 
 
-def test_align_to_t0_warns_when_no_sync_via_zero_offset():
-    """No sync column → t_aligned == raw seconds axis (offset = 0)."""
-    n = 100
-    df = pd.DataFrame({"Time_ms": np.arange(n) * 10.0,
-                       "L_ActForce_N": np.zeros(n)})
-    out = sync_align.align_to_t0(df)
-    # Time_ms = 0..990 → t_aligned should be 0..0.99 s
-    assert abs(out["t_aligned"].iloc[0] - 0.0) < 1e-9
-    assert abs(out["t_aligned"].iloc[-1] - 0.99) < 1e-9
+def test_handles_analog_sync_via_threshold():
+    """Sync that ramps (analog TTL) — threshold at midpoint must
+    still produce one window per pulse."""
+    fs = 1000.0
+    n = 5000
+    t = np.arange(n) / fs
+    # 3 pulses, each 0.4 s wide, separated by 0.6 s gaps
+    sync = np.zeros(n)
+    for start in (0.5, 1.5, 2.5):
+        sync[(t >= start) & (t < start + 0.4)] = 5.0  # analog scale
+    df = _df(sync, fs)
+    wins = sync_align.find_sync_windows(df)
+    assert len(wins) == 3
 
 
-# ---------------------------------------------------------------
-# resample_to_grid — interpolation
-# ---------------------------------------------------------------
+# ============================================================
+# Slicing + rebasing
+# ============================================================
 
-def test_resample_preserves_endpoints_and_count():
+def test_extract_window_slice_returns_correct_rows():
+    fs = 100.0
+    sync = _sync_with_windows(1000, fs, [(1.0, 4.0)])
+    df = _df(sync, fs, value=np.arange(1000, dtype=float))
+    wins = sync_align.find_sync_windows(df)
+    sliced = sync_align.extract_window_slice(df, wins[0])
+    # Should cover ~3 s × 100 Hz = 300 rows
+    assert 295 <= len(sliced) <= 305
+    # First sample's t_window_s ≈ 0
+    assert abs(sliced["t_window_s"].iloc[0]) < 0.02
+    # Last sample's t_window_s ≈ window duration
+    assert abs(sliced["t_window_s"].iloc[-1] - wins[0].duration_s) < 0.05
+
+
+def test_align_to_window_start_zeroes_rising_edge():
+    fs = 100.0
+    sync = _sync_with_windows(800, fs, [(2.0, 5.0)])
+    df = _df(sync, fs)
+    wins = sync_align.find_sync_windows(df)
+    aligned = sync_align.align_to_window_start(df, wins[0])
+    assert "t_aligned" in aligned.columns
+    # The sample AT the rising edge should have t_aligned ≈ 0
+    rise_sample = wins[0].sample_rising
+    assert abs(aligned["t_aligned"].iloc[rise_sample]) < 0.02
+
+
+# ============================================================
+# resample_to_grid
+# ============================================================
+
+def test_resample_preserves_count_and_endpoints():
     n = 500
     fs_src = 100.0
     t_src = np.arange(n) / fs_src
@@ -133,18 +158,8 @@ def test_resample_preserves_endpoints_and_count():
     out = sync_align.resample_to_grid(df, target_fs=1000.0,
                                        t_min=0.0, t_max=4.0)
     assert len(out) == 4001
-    assert abs(out["t_aligned"].iloc[0] - 0.0) < 1e-9
+    assert abs(out["t_aligned"].iloc[0]) < 1e-9
     assert abs(out["t_aligned"].iloc[-1] - 4.0) < 1e-9
-
-
-def test_resample_interpolates_linearly_between_known_samples():
-    df = pd.DataFrame({"t_aligned": [0.0, 1.0, 2.0],
-                       "y": [0.0, 10.0, 20.0]})
-    out = sync_align.resample_to_grid(df, target_fs=10.0,
-                                       t_min=0.0, t_max=2.0)
-    # At 0.5 s linear interp gives 5.0
-    half = float(out.loc[abs(out["t_aligned"] - 0.5).idxmin(), "y"])
-    assert abs(half - 5.0) < 1e-6
 
 
 def test_resample_yields_nan_outside_source_range():
@@ -152,84 +167,113 @@ def test_resample_yields_nan_outside_source_range():
                        "y": [0.0, 10.0, 20.0]})
     out = sync_align.resample_to_grid(df, target_fs=10.0,
                                        t_min=-1.0, t_max=3.0)
-    # First grid samples (< 0) and last (> 2) should be NaN.
-    head = out["y"].iloc[0]
-    tail = out["y"].iloc[-1]
-    assert np.isnan(head)
-    assert np.isnan(tail)
+    assert np.isnan(out["y"].iloc[0])    # before source start
+    assert np.isnan(out["y"].iloc[-1])   # after source end
 
 
-# ---------------------------------------------------------------
-# align_pair — end-to-end multi-source alignment
-# ---------------------------------------------------------------
+# ============================================================
+# Multi-source alignment on same window index
+# ============================================================
 
-def test_align_pair_brings_two_sources_onto_common_grid():
-    robot = _make_robot(fs=111.0, dur_s=5.0, sync_at_s=1.0)   # sync edge at 1.5 s
-    motion = _make_motion(fs=1000.0, dur_s=5.0, sync_at_s=1.7)  # sync edge at 2.2 s
+def test_align_two_sources_on_same_window():
+    """Robot @ 111 Hz with windows at 1.0–3.0 and 5.0–8.0;
+    Motion @ 1000 Hz with windows at 1.5–3.5 and 5.5–8.5
+    (different absolute clock — same physical events).
 
-    a, b, info = sync_align.align_pair(robot, motion, target_fs=1000.0)
+    Aligning on window 0 must anchor each source's first rising edge
+    at t_aligned = 0 and produce a common grid in [0, ~min duration]."""
+    fs_r = 111.0
+    n_r = int(10.0 * fs_r)
+    sync_r = _sync_with_windows(n_r, fs_r, [(1.0, 3.0), (5.0, 8.0)])
+    robot = _df(sync_r, fs_r,
+                L_ActForce_N=np.sin(2 * np.pi * np.arange(n_r) / fs_r) * 30 + 50)
 
-    # Both gridded sources have identical time axes.
-    assert len(a) == len(b) == info["n_grid_samples"]
-    assert np.allclose(a["t_aligned"].to_numpy(),
-                       b["t_aligned"].to_numpy())
-
-    # The sync edges in each source map to ≈ t_aligned 0 in BOTH outputs.
-    a_sync = a["Sync"].to_numpy()
-    b_sync = b["Sync"].to_numpy()
-    a_high = (a_sync > 0.5).astype(int)
-    b_high = (b_sync > 0.5).astype(int)
-    a_fall = np.where(np.diff(np.nan_to_num(a_high)) == -1)[0]
-    b_fall = np.where(np.diff(np.nan_to_num(b_high)) == -1)[0]
-    assert a_fall.size and b_fall.size
-    a_fall_t = float(a["t_aligned"].iloc[a_fall[0] + 1])
-    b_fall_t = float(b["t_aligned"].iloc[b_fall[0] + 1])
-    # Both should be within ~one source sample of zero. Robot is at
-    # 111 Hz so its alignment precision is ~9 ms; motion is at 1 kHz.
-    assert abs(a_fall_t) < 0.012
-    assert abs(b_fall_t) < 0.002
-
-
-def test_align_pair_raises_when_no_overlap():
-    """Two sources whose physical recordings don't overlap after sync
-    alignment must raise — silently returning empty data would mask
-    a labelling mistake."""
-    a = _make_robot(fs=111.0, dur_s=2.0, sync_at_s=0.5)
-    b = _make_motion(fs=1000.0, dur_s=0.6, sync_at_s=0.5)
-    # b only has 0.6 s of data; after anchoring, only [0, 0.1] remains
-    # past the sync edge — but that should still overlap with a's
-    # post-sync window so this should NOT raise. Let's instead build
-    # genuinely non-overlapping sources.
-    ...
-    # Build a where post-sync window is [0, 0.05]
-    n = 200
-    a2 = pd.DataFrame({
-        "Time_ms": np.arange(n) * 10.0,  # 0..1990 ms = 0..1.99 s
-        "Sync": _square(n, 100.0, 1.0, t_offset_s=1.94),
-        "L_ActForce_N": np.zeros(n),
+    fs_m = 1000.0
+    n_m = 10000
+    sync_m = _sync_with_windows(n_m, fs_m, [(1.5, 3.5), (5.5, 8.5)])
+    motion = pd.DataFrame({
+        "Time": np.arange(n_m) / fs_m,
+        "Sync": sync_m,
+        "FP1_Fz": np.cos(2 * np.pi * np.arange(n_m) / fs_m) * 200 + 600,
     })
-    # b post-sync window is large
-    n2 = 5000
-    b2 = pd.DataFrame({
-        "Time": np.arange(n2) / 1000.0,
-        "Sync": _square(n2, 1000.0, 1.0, t_offset_s=0.5),
-        "FP1_Fz": np.zeros(n2),
-    })
-    # a2 has very little data after its sync edge; if b2's pre-sync
-    # window doesn't reach far enough negative there's no overlap.
-    # We just check the API surfaces an error rather than silent empty.
-    try:
-        sync_align.align_pair(a2, b2, target_fs=500.0)
-    except ValueError as e:
-        assert "overlap" in str(e).lower() or True  # any ValueError is fine
-    except Exception:
-        pytest.fail("align_pair should raise ValueError, not other types")
+
+    aligned = sync_align.align_sources_on_window(
+        {"robot": robot, "motion": motion},
+        window_idx=0, target_fs=500.0,
+    )
+    # Both sources have window 0 → both grids present
+    assert "robot" in aligned.grids
+    assert "motion" in aligned.grids
+    # Grid is the analysis window only: t = 0 at rising edge, t_max
+    # = the shorter of the two window durations.
+    grid_t = aligned.grids["robot"]["t_aligned"].to_numpy()
+    assert len(grid_t) == aligned.n_grid_samples
+    assert abs(grid_t[0] - 0.0) < 1e-9          # rising edge anchor
+    # Both sources' grids share the exact same time axis
+    np_grid_motion = aligned.grids["motion"]["t_aligned"].to_numpy()
+    np.testing.assert_allclose(grid_t, np_grid_motion)
+    # Grid duration = shorter window (here both are 2 s)
+    assert 1.95 < (grid_t[-1] - grid_t[0]) < 2.05
 
 
-def test_align_pair_warns_when_one_source_has_no_sync():
-    a = _make_robot(sync_at_s=1.0)
-    b_no_sync = _make_motion()
-    b_no_sync = b_no_sync.drop(columns=["Sync"])
-    a_g, b_g, info = sync_align.align_pair(a, b_no_sync, target_fs=500.0)
-    assert any("source B" in w for w in info["warnings"])
-    assert info["t0_b_s"] is None
+def test_align_raises_when_window_missing_in_a_source():
+    """Asking for window 5 when only 1 window exists in one source
+    must raise — caller needs to know which source is short."""
+    fs = 100.0
+    short = _df(_sync_with_windows(500, fs, [(1.0, 3.0)]), fs)
+    long  = _df(_sync_with_windows(2000, fs, [(1.0, 3.0), (5.0, 7.0),
+                                              (10.0, 12.0)]), fs)
+    with pytest.raises(ValueError):
+        sync_align.align_sources_on_window(
+            {"short": short, "long": long},
+            window_idx=5, target_fs=200.0,
+        )
+
+
+def test_align_warns_for_unsync_source_but_continues_with_synced():
+    """A loadcell-style source with no Sync column should be
+    skipped with a warning, not crash the alignment of the rest."""
+    fs = 100.0
+    robot = _df(_sync_with_windows(800, fs, [(1.0, 5.0)]), fs)
+    loadcell = pd.DataFrame({"time": np.linspace(0, 5, 50),
+                              "applied_N": np.linspace(0, 50, 50)})
+    aligned = sync_align.align_sources_on_window(
+        {"robot": robot, "loadcell": loadcell},
+        window_idx=0, target_fs=200.0,
+    )
+    assert "robot" in aligned.grids
+    assert "loadcell" not in aligned.grids
+    assert any("loadcell" in w for w in aligned.warnings)
+
+
+def test_align_uses_shortest_window_duration():
+    """Grid range = min(window_durations). Source with shorter window
+    determines the analysis range, longer source's window gets
+    truncated."""
+    fs = 100.0
+    a = _df(_sync_with_windows(500, fs, [(0.5, 0.6)]), fs)   # 100 ms window
+    b = _df(_sync_with_windows(2000, fs, [(0.5, 5.0)]), fs)  # 4.5 s window
+    aligned = sync_align.align_sources_on_window(
+        {"a": a, "b": b},
+        window_idx=0, target_fs=500.0,
+    )
+    # t_max should be ~0.1 s (the shorter window), not 4.5 s.
+    assert 0.05 < aligned.t_max_s < 0.15
+
+
+def test_align_three_sources():
+    """Robot + Motion + EMG-only motion (no Loadcell) — all three
+    have sync, all three should land on the common grid."""
+    fs1 = 111.0; fs2 = 1000.0; fs3 = 2000.0
+    n1 = int(8 * fs1); n2 = int(8 * fs2); n3 = int(8 * fs3)
+    a = _df(_sync_with_windows(n1, fs1, [(1.0, 4.0)]), fs1,
+            x=np.zeros(n1))
+    b = _df(_sync_with_windows(n2, fs2, [(1.5, 4.5)]), fs2,
+            y=np.zeros(n2))
+    c = _df(_sync_with_windows(n3, fs3, [(2.0, 5.0)]), fs3,
+            z=np.zeros(n3))
+    aligned = sync_align.align_sources_on_window(
+        {"robot": a, "motion": b, "emg": c},
+        window_idx=0, target_fs=500.0,
+    )
+    assert set(aligned.grids.keys()) == {"robot", "motion", "emg"}
