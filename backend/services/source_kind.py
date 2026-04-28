@@ -80,15 +80,95 @@ _ROBOT_BONUS = {"R_ActForce_N", "L_GCP", "R_GCP", "L_Phase", "R_Phase",
                 "Sync", "L_Pitch", "R_Pitch"}
 
 # Motion capture: any of these patterns are sufficient.
-_FORCE_PLATE_RE = re.compile(
-    r"^(fp\d?|plate\d?|forceplate\d?)_?(f[xyz]|m[xyz]|cop[xy])$",
-    re.IGNORECASE,
+#
+# Recognized export formats:
+#   - Vicon Nexus (Plug-in Gait):
+#       FP1_Fz, FP2_COPx, RHipAngle_X, REMGEnvelope (rare)
+#   - Visual 3D:
+#       LeftFP_Force_Z, RightFP_COP_X, RHipAngle_X, RKneeMoment_Y,
+#       RKneePower
+#   - Anybody Modeling System:
+#       Vastuslateralis_R_Force, BicepsFemoris_L_Activity,
+#       Knee_R_ReactionForce_z
+#   - Qualisys QTM analog (raw):
+#       FP1_Fx, EMG_VL, EMG.VL, Voltage_VL, IM_EMG_1
+# Two distinct patterns:
+#   Vicon-style: `FP1_Fz`, `Plate2_COPx` — terminal token has a leading
+#               F/M/COP prefix glued to xyz
+#   V3D-style:   `LeftFP_Force_Z`, `RightFP_COP_X` — `Force`/`Moment`/`COP`
+#               and the axis are separated by `_`
+_FORCE_PLATE_RE_VICON = re.compile(
+    r"""^(?:fp\d? | plate\d? | forceplate\d?)
+        [_\.\s]?
+        (?:f[xyz] | m[xyz] | cop[xy])
+        $""",
+    re.IGNORECASE | re.VERBOSE,
 )
-_EMG_RE          = re.compile(r"^emg[_\.]?[a-z]+", re.IGNORECASE)
+_FORCE_PLATE_RE_V3D = re.compile(
+    r"""^(?:
+        (?:left|right|l|r)fp\d?     # LeftFP, RightFP, RFP1
+        | fp[_\s]?(?:left|right)    # FP_Left
+    )
+    [_\.\s]?
+    (?:force | moment | cop)
+    [_\.\s]?
+    [xyz]
+    $""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _is_force_plate_col(col: str) -> bool:
+    return bool(_FORCE_PLATE_RE_VICON.match(col)
+                or _FORCE_PLATE_RE_V3D.match(col))
+_EMG_RE = re.compile(
+    r"""^(?:
+        emg[_\.\s]?[a-z]+           # EMG_VL, EMG.VL
+        | [a-z]{2,5}[_\.\s]?emg     # VL_EMG, BF.EMG
+        | voltage[_\.\s]?[a-z]+     # Voltage_VL
+        | im[_\.\s]?emg[_\.\s]?\d+  # IM_EMG_1 (Delsys Trigno indexed)
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
 _MARKER_TRIPLET  = re.compile(r"^[A-Z][A-Za-z0-9]{1,8}_[XYZ]$")
 _JOINT_ANGLE_RE  = re.compile(
-    r"(hip|knee|ankle|pelvis|shoulder|elbow)[_\s]?angle[_\s]?[xyz]?",
-    re.IGNORECASE,
+    r"""(hip|knee|ankle|pelvis|shoulder|elbow|trunk)
+        [_\s]?angle[_\s]?[xyz]?""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_JOINT_MOMENT_RE = re.compile(
+    r"""(hip|knee|ankle|pelvis|shoulder|elbow)
+        [_\s]?moment[_\s]?[xyz]?""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_JOINT_POWER_RE  = re.compile(
+    r"""(hip|knee|ankle)[_\s]?power""",
+    re.IGNORECASE | re.VERBOSE,
+)
+# Anybody Modeling System patterns.
+#  - Muscle force: e.g. `Vastuslateralis_R_Force`, `Bicepsfemoris_L`
+#  - Muscle activity: `<MuscleName>_R_Activity`
+#  - Joint reaction force: `Knee_R_ReactionForce_z`
+_ANYBODY_MUSCLE_RE = re.compile(
+    r"""^(?:
+        vastus(?:lateralis|medialis|intermedius)
+        | bicepsfemoris
+        | semitendinosus
+        | semimembranosus
+        | rectusfemoris
+        | gastrocnemius(?:medialis|lateralis)?
+        | soleus
+        | tibialisanterior
+        | gluteus(?:maximus|medius|minimus)
+    )
+    _[lr]
+    (?:_(?:force|activity))?
+    $""",
+    re.IGNORECASE | re.VERBOSE,
+)
+_ANYBODY_REACTION_RE = re.compile(
+    r"""^(hip|knee|ankle|pelvis)_[lr]_reactionforce_[xyz]$""",
+    re.IGNORECASE | re.VERBOSE,
 )
 _VICON_TRIGGER_RE = re.compile(r"^(sync|trigger|ttl|analog\d+)$", re.IGNORECASE)
 
@@ -113,11 +193,18 @@ def detect_from_columns(columns: list[str]) -> tuple[SourceKind, list[str]]:
         return "robot", cues
 
     # ---- Motion ----
-    fp_cols   = [c for c in columns if _FORCE_PLATE_RE.match(c)]
-    emg_cols  = [c for c in columns if _EMG_RE.match(c)]
-    marker_cols = [c for c in columns if _MARKER_TRIPLET.match(c)]
-    angle_cols = [c for c in columns if _JOINT_ANGLE_RE.search(c)]
-    motion_signals = bool(fp_cols or emg_cols or marker_cols or angle_cols)
+    fp_cols       = [c for c in columns if _is_force_plate_col(c)]
+    emg_cols      = [c for c in columns if _EMG_RE.match(c)]
+    marker_cols   = [c for c in columns if _MARKER_TRIPLET.match(c)]
+    angle_cols    = [c for c in columns if _JOINT_ANGLE_RE.search(c)]
+    moment_cols   = [c for c in columns if _JOINT_MOMENT_RE.search(c)]
+    power_cols    = [c for c in columns if _JOINT_POWER_RE.search(c)]
+    muscle_cols   = [c for c in columns if _ANYBODY_MUSCLE_RE.match(c)]
+    reaction_cols = [c for c in columns if _ANYBODY_REACTION_RE.match(c)]
+    motion_signals = bool(
+        fp_cols or emg_cols or marker_cols or angle_cols
+        or moment_cols or power_cols or muscle_cols or reaction_cols
+    )
     if motion_signals:
         if fp_cols:
             cues.append(f"force-plate: {', '.join(fp_cols[:3])}"
@@ -129,6 +216,14 @@ def detect_from_columns(columns: list[str]) -> tuple[SourceKind, list[str]]:
             cues.append(f"markers: {len(marker_cols)} XYZ columns")
         if angle_cols:
             cues.append(f"joint angles: {', '.join(angle_cols[:3])}")
+        if moment_cols:
+            cues.append(f"joint moments (V3D): {', '.join(moment_cols[:3])}")
+        if power_cols:
+            cues.append(f"joint powers (V3D): {', '.join(power_cols[:3])}")
+        if muscle_cols:
+            cues.append(f"Anybody muscles: {', '.join(muscle_cols[:3])}")
+        if reaction_cols:
+            cues.append(f"Anybody reaction forces: {', '.join(reaction_cols[:3])}")
         return "motion", cues
 
     # ---- Loadcell ----

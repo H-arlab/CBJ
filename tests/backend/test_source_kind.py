@@ -96,6 +96,65 @@ def test_columns_motion_joint_angles():
     assert kind == "motion"
 
 
+def test_columns_visual3d_force_plate_naming():
+    """Visual 3D exports force plates as `LeftFP_Force_Z`,
+    `RightFP_COP_X` etc. — must be detected as motion."""
+    cols = ["Frame", "Time",
+            "LeftFP_Force_X", "LeftFP_Force_Y", "LeftFP_Force_Z",
+            "LeftFP_COP_X", "LeftFP_COP_Y",
+            "RightFP_Force_Z", "RightFP_Moment_X"]
+    kind, cues = detect_from_columns(cols)
+    assert kind == "motion"
+    assert any("force-plate" in c for c in cues)
+
+
+def test_columns_visual3d_joint_moments_and_powers():
+    """V3D inverse-dynamics output."""
+    cols = ["Time",
+            "RHipAngle_X", "RHipMoment_X", "RKneePower",
+            "LHipAngle_X", "LKneeMoment_Y"]
+    kind, cues = detect_from_columns(cols)
+    assert kind == "motion"
+    assert any("moments" in c.lower() for c in cues)
+    assert any("powers" in c.lower() for c in cues)
+
+
+def test_columns_anybody_muscle_force():
+    """Anybody Modeling System exports `Vastuslateralis_R_Force` etc."""
+    cols = ["Time",
+            "Vastuslateralis_R_Force", "Vastuslateralis_L_Force",
+            "Bicepsfemoris_R_Activity", "Bicepsfemoris_L_Activity",
+            "Gastrocnemius_R", "Soleus_L"]
+    kind, cues = detect_from_columns(cols)
+    assert kind == "motion"
+    assert any("muscle" in c.lower() for c in cues)
+
+
+def test_columns_anybody_reaction_force():
+    cols = ["Time",
+            "Knee_R_ReactionForce_x", "Knee_R_ReactionForce_y",
+            "Knee_R_ReactionForce_z", "Hip_L_ReactionForce_z"]
+    kind, cues = detect_from_columns(cols)
+    assert kind == "motion"
+    assert any("reaction" in c.lower() for c in cues)
+
+
+def test_columns_emg_voltage_prefix():
+    """Some QTM exports prefix with `Voltage_` before the muscle name."""
+    cols = ["Time", "Voltage_VL", "Voltage_BF", "Voltage_GAS"]
+    kind, cues = detect_from_columns(cols)
+    assert kind == "motion"
+    assert any("EMG" in c for c in cues)
+
+
+def test_columns_emg_delsys_indexed():
+    """Delsys Trigno exports `IM_EMG_1`, `IM_EMG_2`, etc."""
+    cols = ["Time", "IM_EMG_1", "IM_EMG_2", "IM_EMG_3", "IM_EMG_4"]
+    kind, cues = detect_from_columns(cols)
+    assert kind == "motion"
+    assert any("EMG" in c for c in cues)
+
+
 def test_columns_loadcell_calibration():
     cols = ["time", "applied_N", "robot_N"]
     kind, cues = detect_from_columns(cols)
