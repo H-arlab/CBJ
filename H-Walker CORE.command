@@ -71,10 +71,29 @@ fi
 
 # Defensive: rebuild the frontend dist if it's missing or older
 # than the latest source change. After a `git pull` of a UI commit
-# this is the most common cause of a black browser screen.
+# this is the most common cause of a black browser screen, or worse —
+# the app boots but serves stale labels (the operator sees old card
+# titles even though they checked out a newer branch).
 if [ -d "frontend" ]; then
+    needs_build=0
     if [ ! -f "frontend/dist/index.html" ]; then
+        needs_build=1
         echo "[launcher] frontend/dist not found — building once…"
+    else
+        # Find any source file newer than the existing bundle.
+        # `-newer` returns just one match (head -n 1) — that's enough
+        # to trigger a rebuild without scanning the whole tree.
+        newest_src=$(find frontend/src frontend/index.html frontend/package.json \
+                          frontend/vite.config.ts frontend/tsconfig.json \
+                          -type f \( -name '*.ts' -o -name '*.tsx' -o -name '*.css' \
+                                  -o -name '*.html' -o -name '*.json' \) \
+                          -newer frontend/dist/index.html 2>/dev/null | head -n 1)
+        if [ -n "$newest_src" ]; then
+            needs_build=1
+            echo "[launcher] frontend source newer than dist (e.g. $newest_src) — rebuilding…"
+        fi
+    fi
+    if [ "$needs_build" = "1" ]; then
         ( cd frontend && npm install --silent && npm run build ) || {
             echo "[launcher] frontend build failed — fix the error above and re-run."
             exit 1
