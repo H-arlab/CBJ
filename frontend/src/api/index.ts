@@ -375,15 +375,6 @@ export const fetchWindow = (dsId: string, req: WindowRequest) =>
 // Sync alignment — multi-source experiments (Robot + Motion + Loadcell)
 // ============================================================
 
-export interface SyncEdgeResponse {
-  dataset_id: string;
-  sync_column: string | null;
-  first_falling_t_s: number | null;
-}
-
-export const fetchSyncEdge = (dsId: string) =>
-  json<SyncEdgeResponse>(`/api/sync/${dsId}/edge`);
-
 export interface AlignRequest {
   dataset_ids: string[];
   target_fs_hz?: number;

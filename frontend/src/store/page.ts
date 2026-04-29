@@ -105,10 +105,8 @@ interface PageState {
   history: HistoryEntry[];
   drawer: DrawerKind;
   focusCellId: string | null;
-  cmdkOpen: boolean;
   mapperOpen: boolean;
   mapperDsId: string | null;
-  helpOpen: boolean;
   toast: { msg: string; id: number } | null;
   runAllBusy: boolean;
 
@@ -139,10 +137,8 @@ interface PageState {
 
   openDrawer: (k: DrawerKind) => void;
   closeDrawer: () => void;
-  toggleCmdK: (v?: boolean) => void;
   openMapper: (dsId: string) => void;
   closeMapper: () => void;
-  toggleHelp: (v?: boolean) => void;
   focusCell: (id: string | null) => void;
   showToast: (msg: string) => void;
 
@@ -168,10 +164,8 @@ export const usePage = create<PageState>()(
       history: [],
       drawer: null,
       focusCellId: null,
-      cmdkOpen: false,
       mapperOpen: false,
       mapperDsId: null,
-      helpOpen: false,
       toast: null,
       runAllBusy: false,
 
@@ -607,10 +601,8 @@ export const usePage = create<PageState>()(
 
       openDrawer: (k) => set({ drawer: k }),
       closeDrawer: () => set({ drawer: null }),
-      toggleCmdK: (v) => set((s) => ({ cmdkOpen: v ?? !s.cmdkOpen })),
       openMapper: (dsId) => set({ mapperOpen: true, mapperDsId: dsId }),
       closeMapper: () => set({ mapperOpen: false, mapperDsId: null }),
-      toggleHelp: (v) => set((s) => ({ helpOpen: v ?? !s.helpOpen })),
       focusCell: (id) => set({ focusCellId: id }),
       showToast: (msg) => set({ toast: { msg, id: ++_toastSeq } }),
     }),
