@@ -420,15 +420,15 @@ body.focused .canvas,body.focused .llm-dock{filter:blur(1px)}
 /* Publication bar */
 .pubbar{position:sticky;top:54px;z-index:40;background:linear-gradient(180deg,#0F1729 0%,rgba(15,23,41,.95) 100%);border-bottom:1px solid rgba(240,151,8,.15);backdrop-filter:blur(8px);animation:pubslide .28s ease}
 @keyframes pubslide{from{transform:translateY(-8px);opacity:0}to{transform:translateY(0);opacity:1}}
-.pubbar-inner{display:flex;align-items:center;gap:18px;padding:10px 24px;max-width:1200px;margin:0 auto}
-.pubbar-label{display:flex;flex-direction:column;gap:2px;min-width:150px}
+.pubbar-inner{display:flex;flex-wrap:wrap;align-items:center;gap:18px;row-gap:10px;padding:10px 24px;max-width:1400px;margin:0 auto}
+.pubbar-label{display:flex;flex-direction:column;gap:2px;min-width:150px;flex:0 0 auto}
 .pubbar-eyebrow{font:600 9px/1 var(--mono,ui-monospace,monospace);color:#F09708;letter-spacing:.18em;text-transform:uppercase}
 .pubbar-title{font:700 16px/1.1 var(--sans,system-ui);color:#F8FAFC;letter-spacing:-.01em}
-.pubbar-tabs{display:flex;gap:2px;background:rgba(0,0,0,.25);padding:3px;border-radius:7px;border:1px solid rgba(255,255,255,.05)}
-.pubbar-tab{background:none;border:none;color:#94A3B8;padding:6px 12px;border-radius:5px;font:600 11.5px/1.4 var(--mono,ui-monospace,monospace);letter-spacing:.04em;cursor:pointer;transition:all .14s}
+.pubbar-tabs{display:flex;flex-wrap:wrap;gap:2px;background:rgba(0,0,0,.25);padding:3px;border-radius:7px;border:1px solid rgba(255,255,255,.05)}
+.pubbar-tab{background:none;border:none;color:#94A3B8;padding:6px 12px;border-radius:5px;font:600 11.5px/1.4 var(--mono,ui-monospace,monospace);letter-spacing:.04em;cursor:pointer;transition:all .14s;white-space:nowrap}
 .pubbar-tab:hover{color:#CBD5E1;background:rgba(255,255,255,.03)}
 .pubbar-tab.active{background:#F09708;color:#0B1120;box-shadow:0 1px 0 rgba(0,0,0,.2)}
-.pubbar-spec{margin-left:auto;display:flex;gap:16px;font:500 11px/1.3 var(--mono,ui-monospace,monospace);color:#7A869A;align-items:center}
+.pubbar-spec{margin-left:auto;display:flex;flex-wrap:wrap;gap:16px;row-gap:6px;font:500 11px/1.3 var(--mono,ui-monospace,monospace);color:#7A869A;align-items:center}
 .pubbar-spec .spec-item{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
 .pubbar-spec .spec-k{color:#64748B;font-size:9.5px;text-transform:uppercase;letter-spacing:.1em}
 .pubbar-spec .spec-v{color:#CBD5E1;font-weight:600}

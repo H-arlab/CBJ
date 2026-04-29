@@ -87,19 +87,32 @@ def _content_hash(data: bytes) -> str:
 # first match wins. Named groups drive the Dataset.{group, subject_id,
 # condition} fields. Keep these case-insensitive and tolerant of
 # separators (_, -, .).
+#
+# Conservative on purpose: a bare 1-3 digit number is ONLY treated as
+# subject_id when it follows an explicit `s` / `subj_` marker. Any
+# other trailing number is a trial index (`robot_high_0.CSV`,
+# `loadcell_low_30.CSV`) and must not silently pollute the subject
+# field. The user can still enter subject_id manually in the dataset
+# panel — better blank than wrong.
 import re
 _FILENAME_PATTERNS = [
     # explicit labels: subject=s01 · condition=pre · date=2024-05-01
     re.compile(r'(?i)(?:subj(?:ect)?[_-]?)?(?P<subject_id>s\d+)[_\-.]+'
                r'(?P<condition>pre|post|control|experimental|baseline|'
-               r'treatment|treadmill|overground|\w{2,12})'
+               r'treatment|treadmill|overground|[a-z]{2,12})'
                r'(?:[_\-.]+(?P<date>\d{4}[_\-.]?\d{2}[_\-.]?\d{2}))?'),
-    # condition first: pre_s01_… / control-subj02-…
+    # condition first, subject is `s\d+` OR `subj_\d+` (digit-only bare
+    # numbers are NOT accepted here — too ambiguous with trial idx).
     re.compile(r'(?i)^(?P<condition>pre|post|control|experimental|baseline|'
-               r'treatment|fast|slow|natural|\w{3,10})'
-               r'[_\-.]+(?:subj(?:ect)?[_-]?)?(?P<subject_id>s\d+|\d{1,3})'),
-    # numeric only: 001_pre_…
-    re.compile(r'(?i)^(?P<subject_id>\d{1,3})[_\-.]+(?P<condition>[a-z]{3,15})'),
+               r'treatment|fast|slow|natural|[a-z]{3,10})'
+               r'[_\-.]+(?:subj(?:ect)?[_-]?)(?P<subject_id>\d{1,3}|s\d+)'),
+    # condition first, subject explicitly s-prefixed (no separator
+    # ambiguity): `treadmill_s07_03.csv`
+    re.compile(r'(?i)^(?P<condition>[a-z]{3,15})[_\-.]+(?P<subject_id>s\d+)'),
+    # numeric only: 001_pre_…  (subject must precede a known-shape
+    # condition word, not a free-form `\w{3,10}` that would happily
+    # eat an underscore-bearing token).
+    re.compile(r'(?i)^(?P<subject_id>\d{1,3})[_\-.]+(?P<condition>[a-z]{3,15})$'),
     # trial_N style (keep existing recipe behavior, not really a group)
     re.compile(r'(?i)(?P<subject_id>trial[_-]?\d+)'),
 ]

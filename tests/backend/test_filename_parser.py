@@ -167,3 +167,68 @@ class TestZeroPaddingRobustness:
         p = parse("260427_TD_level_1.0_H-Walker_s7_prox_axial_1.csv")
         assert p is not None
         assert p.subject == "s07"
+
+
+# ============================================================
+# Upload heuristic — `backend/routers/datasets.py:_parse_filename`
+# is a SEPARATE parser used to *guess* (subject_id, condition, group)
+# for arbitrary uploaded filenames that don't match the canonical
+# 9-token shape. Regression for the operator's report: filenames
+# like `robot_high_0.CSV` and `loadcell_low_30.CSV` were silently
+# extracting the trial-index suffix as subject_id ("0", "30") and
+# stamping that on the Dataset card.
+# ============================================================
+
+class TestUploadFilenameHeuristic:
+    def test_robot_high_0_does_not_invent_subject(self):
+        """The trailing `_0` is the trial index, not a subject."""
+        from backend.routers.datasets import _parse_filename
+        out = _parse_filename("robot_high_0.CSV")
+        assert "subject_id" not in out, (
+            f"robot_high_0.CSV should not auto-populate subject_id; "
+            f"got {out!r}"
+        )
+
+    def test_loadcell_low_30_does_not_invent_subject(self):
+        from backend.routers.datasets import _parse_filename
+        out = _parse_filename("loadcell_low_30.CSV")
+        assert "subject_id" not in out, (
+            f"loadcell_low_30.CSV should not auto-populate subject_id; "
+            f"got {out!r}"
+        )
+
+    def test_explicit_s_prefix_still_parses(self):
+        from backend.routers.datasets import _parse_filename
+        out = _parse_filename("s07_pre_2024_05_01.csv")
+        assert out.get("subject_id") == "s07"
+        assert out.get("condition") == "Pre"
+
+    def test_subj_prefix_picks_up_bare_digits(self):
+        from backend.routers.datasets import _parse_filename
+        out = _parse_filename("pre_subj_07.csv")
+        assert out.get("subject_id") == "07"
+
+    def test_leading_digits_only_with_known_condition(self):
+        from backend.routers.datasets import _parse_filename
+        out = _parse_filename("001_pre.csv")
+        assert out.get("subject_id") == "001"
+        assert out.get("condition") == "Pre"
+
+    def test_random_garbage_returns_empty(self):
+        from backend.routers.datasets import _parse_filename
+        assert _parse_filename("random_garbage.csv") == {}
+
+    def test_robot_underscore_word_underscore_digit_returns_empty(self):
+        """Generalization of the operator's case — any
+        `<word>_<word>_<digit>.csv` shape must NOT misattribute the
+        trailing digit as subject."""
+        from backend.routers.datasets import _parse_filename
+        for fn in (
+            "Robot_high_3.csv",
+            "Motion_low_15.csv",
+            "loadcell_baseline_2.csv",
+        ):
+            out = _parse_filename(fn)
+            assert "subject_id" not in out, (
+                f"{fn} should not auto-populate subject_id; got {out!r}"
+            )
