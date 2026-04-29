@@ -153,18 +153,26 @@ class TestJournalListEndpoint:
         resp = client.get("/api/journal/list")
         assert resp.status_code == 200
 
-    def test_journal_list_is_a_list(self):
+    def test_journal_list_payload_shape(self):
         resp = client.get("/api/journal/list")
         body = resp.json()
-        assert isinstance(body, list)
+        assert isinstance(body, dict)
+        assert isinstance(body.get("journals"), list)
+        for entry in body["journals"]:
+            assert {"key", "name"} <= entry.keys()
 
     def test_journal_list_contains_expected_journals(self):
         resp = client.get("/api/journal/list")
-        journals = resp.json()
-        for expected in ["ieee_tnsre", "jner", "default", "nature"]:
-            assert expected in journals, f"Missing journal: {expected}"
+        keys = {entry["key"] for entry in resp.json()["journals"]}
+        # The endpoint reads from backend/journal_styles/*.json; "default"
+        # is a fallback bucket inside JOURNAL_RCPARAMS but is not exposed
+        # as a preset file, so it should not appear in the listing.
+        for expected in ["ieee_tnsre", "jner", "nature"]:
+            assert expected in keys, f"Missing journal: {expected}"
 
-    def test_journal_list_has_10_entries(self):
-        from backend.services.graph_publication import JOURNAL_RCPARAMS
+    def test_journal_list_matches_preset_dir(self):
+        from backend.services.journal_resolver import STYLES_DIR
         resp = client.get("/api/journal/list")
-        assert len(resp.json()) == len(JOURNAL_RCPARAMS)
+        files = {p.stem for p in STYLES_DIR.glob("*.json") if "cached" not in str(p)}
+        keys = {entry["key"] for entry in resp.json()["journals"]}
+        assert keys == files

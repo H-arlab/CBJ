@@ -127,7 +127,10 @@ class TestBuildTraces:
         line = traces[0]["line"]
         assert "color" in line
         assert "width" in line
-        assert line["width"] == pytest.approx(1.5)
+        # graph_quick uses thinner stroke for "desired" channels (1.2)
+        # and thicker for "actual" measurements (1.8). L_ActForce_N is
+        # an actual measurement, so it must come back at the bolder width.
+        assert line["width"] == pytest.approx(1.8)
 
     def test_multiple_files_produce_distinct_traces(self):
         df1 = self._make_df()

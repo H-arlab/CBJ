@@ -131,9 +131,9 @@ class TestIntegrationQuick:
     def test_journal_list_integration(self):
         resp = client.get("/api/journal/list")
         assert resp.status_code == 200
-        journals = resp.json()
-        assert "ieee_tnsre" in journals
-        assert "default" in journals
+        keys = {entry["key"] for entry in resp.json()["journals"]}
+        assert "ieee_tnsre" in keys
+        assert "nature" in keys
 
 
 class TestIntegrationPublication:
