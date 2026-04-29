@@ -26,15 +26,17 @@ import pandas as pd
 from fastapi import APIRouter, HTTPException
 
 from backend.services.dataset_registry import get_path, _REGISTRY
-from backend.services.analysis_engine import run_full_analysis
+from backend.services.analysis_engine import (
+    run_full_analysis, run_per_window_analysis, count_sync_windows,
+)
 from tools.auto_analyzer.analyzer import result_to_dict, AnalysisResult
 
 
 router = APIRouter(prefix="/api/analyze", tags=["analyze"])
 
 
-# In-memory cache: ds_id → (AnalysisResult, payload_dict)
-_CACHE: dict[str, tuple[AnalysisResult, dict[str, Any]]] = {}
+# In-memory cache: (ds_id, window_idx) → (AnalysisResult, payload_dict)
+_CACHE: dict[tuple[str, int], tuple[AnalysisResult, dict[str, Any]]] = {}
 
 # Phase 4 · disk cache for analyzer results. Keyed by CSV content hash
 # (sha256 of first 1 MB + mtime + size) so identical files across
@@ -58,11 +60,11 @@ def _cache_key(path: str) -> str:
         return ""
 
 
-def _disk_load(path: str) -> tuple[AnalysisResult, dict[str, Any]] | None:
+def _disk_load(path: str, window_idx: int) -> tuple[AnalysisResult, dict[str, Any]] | None:
     key = _cache_key(path)
     if not key:
         return None
-    cpath = _DISK_CACHE_DIR / f"{key}.pkl"
+    cpath = _DISK_CACHE_DIR / f"{key}_w{window_idx}.pkl"
     if not cpath.exists():
         return None
     try:
@@ -72,11 +74,11 @@ def _disk_load(path: str) -> tuple[AnalysisResult, dict[str, Any]] | None:
         return None
 
 
-def _disk_save(path: str, res: AnalysisResult, payload: dict[str, Any]) -> None:
+def _disk_save(path: str, window_idx: int, res: AnalysisResult, payload: dict[str, Any]) -> None:
     key = _cache_key(path)
     if not key:
         return
-    cpath = _DISK_CACHE_DIR / f"{key}.pkl"
+    cpath = _DISK_CACHE_DIR / f"{key}_w{window_idx}.pkl"
     try:
         with open(cpath, "wb") as f:
             pickle.dump((res, payload), f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -137,13 +139,36 @@ def _profile_to_json(fp) -> dict[str, Any]:
     return out
 
 
-def _result_payload(res: AnalysisResult) -> dict[str, Any]:
-    """Convert AnalysisResult to JSON, including force profiles."""
+def _result_payload(res: AnalysisResult, n_windows: int = 1) -> dict[str, Any]:
+    """Convert AnalysisResult to JSON, including force profiles + sync window meta.
+
+    `n_windows` is the total trial count in the recording so the
+    frontend can offer a window selector when there's more than one.
+    Per-window slicing is enforced upstream by `run_full_analysis`,
+    which reads only `[rising, falling)` samples — data outside the
+    sync window never reaches the analyzer.
+    """
     d = result_to_dict(res)
     d["mode"] = "hwalker"
     d["profiles"] = {
         "left": _profile_to_json(res.left_force_profile),
         "right": _profile_to_json(res.right_force_profile),
+    }
+    # Sync window provenance: which trial in the recording this is.
+    d["sync"] = {
+        "n_windows": int(n_windows),
+        "window_idx": (int(res.sync_window_idx)
+                        if res.sync_window_idx is not None else None),
+        "t_rise_s": (float(res.sync_window_t_rise_s)
+                      if res.sync_window_t_rise_s is not None else None),
+        "t_fall_s": (float(res.sync_window_t_fall_s)
+                      if res.sync_window_t_fall_s is not None else None),
+        "duration_s": (
+            float(res.sync_window_t_fall_s - res.sync_window_t_rise_s)
+            if (res.sync_window_t_rise_s is not None
+                and res.sync_window_t_fall_s is not None)
+            else None
+        ),
     }
     # Per-stride arrays (truncated for payload size)
     for side_name, sr in [("left", res.left_stride), ("right", res.right_stride)]:
@@ -155,26 +180,32 @@ def _result_payload(res: AnalysisResult) -> dict[str, Any]:
     return d
 
 
-def analyze_cached(ds_id: str) -> tuple[AnalysisResult | None, dict[str, Any]]:
-    """Return (AnalysisResult, payload). Result may be None in fallback mode.
+def analyze_cached(
+    ds_id: str, window_idx: int = 0,
+) -> tuple[AnalysisResult | None, dict[str, Any]]:
+    """Return (AnalysisResult, payload) for a single sync window.
+
+    Per the user's sync contract a recording with N rising/falling
+    pulses is N trials and analysis must use **only data inside the
+    [rising, falling) window**. `window_idx` selects which trial.
 
     Cache hierarchy:
-      1. Per-session in-memory (fastest)
-      2. Disk cache keyed by file content hash (survives restarts)
-      3. Fresh analysis via auto_analyzer
+      1. Per-session in-memory (fastest, keyed on (ds_id, window_idx))
+      2. Disk cache keyed by file content hash + window
+      3. Fresh sync-sliced analysis via auto_analyzer
     """
-    if ds_id in _CACHE:
-        res, payload = _CACHE[ds_id]
-        return res, payload
+    cache_key = (ds_id, window_idx)
+    if cache_key in _CACHE:
+        return _CACHE[cache_key]
 
     path = get_path(ds_id)
     if not path:
         raise HTTPException(status_code=404, detail=f"dataset '{ds_id}' not found")
 
     # Disk cache — skip the full pipeline when we've seen this file before
-    cached = _disk_load(path)
+    cached = _disk_load(path, window_idx)
     if cached is not None:
-        _CACHE[ds_id] = cached
+        _CACHE[cache_key] = cached
         return cached
 
     try:
@@ -185,40 +216,92 @@ def analyze_cached(ds_id: str) -> tuple[AnalysisResult | None, dict[str, Any]]:
     ds_name = _REGISTRY.get(ds_id, {}).get("name", "unknown.csv")
 
     if not _is_hwalker_csv(df):
-        # Read full CSV for generic mode
+        # Generic mode: no sync semantics, return descriptive stats only.
         try:
             full = pd.read_csv(path)
         except Exception as exc:
             raise HTTPException(status_code=422, detail=f"CSV unreadable: {exc}") from exc
         payload = _generic_analysis(full, ds_name)
-        _CACHE[ds_id] = (None, payload)  # type: ignore[assignment]
+        _CACHE[cache_key] = (None, payload)  # type: ignore[assignment]
         return None, payload
 
+    n_windows = count_sync_windows(path)
+    if window_idx < 0 or window_idx >= n_windows:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"window_idx={window_idx} out of range; recording has "
+                f"{n_windows} sync window(s)"
+            ),
+        )
+
     try:
-        res = run_full_analysis(path)
+        res = run_full_analysis(path, window_idx=window_idx)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"analyzer failed: {exc}") from exc
 
-    payload = _result_payload(res)
-    _CACHE[ds_id] = (res, payload)
-    _disk_save(path, res, payload)
+    payload = _result_payload(res, n_windows=n_windows)
+    _CACHE[cache_key] = (res, payload)
+    _disk_save(path, window_idx, res, payload)
     return res, payload
 
 
 def invalidate_cache(ds_id: str) -> None:
-    _CACHE.pop(ds_id, None)
+    """Drop every per-window entry for this dataset."""
+    for key in list(_CACHE.keys()):
+        if key[0] == ds_id:
+            _CACHE.pop(key, None)
 
 
 @router.get("/{ds_id}")
-def analyze(ds_id: str) -> dict[str, Any]:
-    """Run or fetch cached H-Walker analysis for a dataset."""
-    _, payload = analyze_cached(ds_id)
+def analyze(ds_id: str, window: int = 0) -> dict[str, Any]:
+    """Run or fetch cached H-Walker analysis for one sync window.
+
+    Default `window=0` returns the first trial. Use `?window=N` to
+    pick a later trial in the same recording. The response always
+    includes `sync.n_windows` so callers know how many trials are
+    available without a separate probe call.
+    """
+    _, payload = analyze_cached(ds_id, window_idx=window)
     return payload
+
+
+@router.get("/{ds_id}/windows")
+def list_windows(ds_id: str) -> dict[str, Any]:
+    """List every sync window in a dataset with per-trial metadata.
+
+    Light-weight probe — runs the rising/falling edge detector but
+    not the full analyzer. Use this to populate a trial picker in the
+    UI before deciding which window(s) to analyze.
+    """
+    path = get_path(ds_id)
+    if not path:
+        raise HTTPException(status_code=404, detail=f"dataset '{ds_id}' not found")
+    from backend.services.sync_align import find_sync_windows
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail=f"CSV unreadable: {exc}") from exc
+    windows = find_sync_windows(df)
+    return {
+        "ds_id": ds_id,
+        "n_windows": len(windows),
+        "windows": [
+            {
+                "idx": w.index,
+                "t_rise_s": float(w.rising_t_s),
+                "t_fall_s": float(w.falling_t_s),
+                "duration_s": float(w.duration_s),
+                "n_samples": int(w.sample_falling - w.sample_rising),
+            }
+            for w in windows
+        ],
+    }
 
 
 @router.delete("/{ds_id}/cache")
 def drop_cache(ds_id: str) -> dict[str, Any]:
-    existed = ds_id in _CACHE
+    existed = any(k[0] == ds_id for k in _CACHE)
     invalidate_cache(ds_id)
     return {"ds_id": ds_id, "invalidated": existed}
 

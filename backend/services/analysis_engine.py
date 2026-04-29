@@ -18,6 +18,7 @@ if _PROJECT_ROOT not in sys.path:
 
 from tools.auto_analyzer.analyzer import (
     analyze_file as _analyze_file,
+    analyze_file_windows as _analyze_file_windows,
     AnalysisResult,
     result_to_dict,
     compare_results,
@@ -169,13 +170,65 @@ def compute_symmetry_index(left: np.ndarray, right: np.ndarray) -> float:
     return abs(ml - mr) / abs(denominator) * 100.0
 
 
-def run_full_analysis(filepath: str, analyses: list[str] = None) -> AnalysisResult:
-    """Run full auto_analyzer analysis on a CSV file.
+def run_full_analysis(
+    filepath: str,
+    analyses: list[str] = None,
+    window_idx: int = 0,
+) -> AnalysisResult:
+    """Run full auto_analyzer analysis on a single sync window of a CSV.
 
-    Returns the rich AnalysisResult with stride times, stride lengths (ZUPT),
-    force tracking errors, symmetry, fatigue, and force profiles.
+    Per the user-confirmed sync contract (CLAUDE.md, 2026-04-25):
+      one sync window = [rising, falling) = one trial. Analysis must
+      use **only data inside the window** — outside is prep/rest.
+
+    Default `window_idx=0` returns the first trial; pass a different
+    index to pick a later trial in the same recording. If the file
+    has no Sync column or no detectable windows, the analyzer falls
+    back to whole-CSV analysis transparently.
     """
-    return _analyze_file(filepath, analyses)
+    results = _analyze_file_windows(filepath, analyses)
+    if not results:
+        # analyze_file_windows always returns ≥1 element by contract,
+        # but guard anyway so we never silently return None.
+        raise ValueError(f"analyzer produced 0 results for {filepath}")
+    if window_idx < 0 or window_idx >= len(results):
+        raise IndexError(
+            f"window_idx={window_idx} out of range; recording has "
+            f"{len(results)} window(s)"
+        )
+    return results[window_idx]
+
+
+def run_per_window_analysis(
+    filepath: str,
+    analyses: list[str] = None,
+) -> list[AnalysisResult]:
+    """Return one AnalysisResult per sync window in the recording.
+
+    Use this when the caller needs to compare or aggregate trials
+    inside a single CSV (e.g. trial-pairing across Robot+Motion at
+    the same window index). Single-element list when the file has
+    no sync information.
+    """
+    return _analyze_file_windows(filepath, analyses)
+
+
+def count_sync_windows(filepath: str) -> int:
+    """How many sync windows (trials) are in this CSV.
+
+    Cheap — only loads the CSV and runs the rising/falling edge
+    detector, no full analysis. Returns 1 when there's no Sync
+    column or no detectable windows (the analyzer treats that as a
+    single-trial fallback, so callers can use this count directly).
+    """
+    import pandas as pd
+    from backend.services.sync_align import find_sync_windows
+    try:
+        df = pd.read_csv(filepath)
+    except Exception:
+        return 1
+    n = len(find_sync_windows(df))
+    return n if n > 0 else 1
 
 
 def full_analysis_to_stats(result: AnalysisResult) -> list[StatsResult]:
