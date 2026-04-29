@@ -79,12 +79,16 @@ def _build_app():
     from backend.routers.compute import router as compute_router
     from backend.routers.stats import router as stats_router
     from backend.routers.paper import router as paper_router
+    from backend.routers.inspector import router as inspector_router
+    from backend.routers.sync import router as sync_router
     app.include_router(datasets_router)
     app.include_router(graphs_router)
     app.include_router(analyze_router)
     app.include_router(compute_router)
     app.include_router(stats_router)
     app.include_router(paper_router)
+    app.include_router(inspector_router)
+    app.include_router(sync_router)
 
     # Optional: Claude
     try:
