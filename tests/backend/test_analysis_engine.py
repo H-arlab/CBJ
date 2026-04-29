@@ -307,3 +307,96 @@ class TestSyncSlicing:
         # Whole-file analysis covers ~12 s, so we should see noticeably
         # more strides than a single 4 s window would yield (~3).
         assert res.left_stride.n_strides >= 8
+
+
+def _make_poison_outside_csv(tmp_path,
+                              fs: float = 111.0,
+                              dur_s: float = 12.0,
+                              stride_s: float = 1.05,
+                              poison: float = 999.0) -> str:
+    """Two sync windows with clean strides inside; everything outside
+    every window is set to a POISON value. If the slicer leaks even
+    one out-of-window sample into the analyzer, the profile peak
+    will spike up to `poison`."""
+    n = int(dur_s * fs)
+    t = np.arange(n) / fs
+    sync = np.zeros(n)
+    sync[(t >= 1.0) & (t < 5.0)] = 1.0
+    sync[(t >= 7.0) & (t < 11.0)] = 1.0
+    in_window = sync > 0.5
+    out_window = ~in_window
+    df = pd.DataFrame({
+        "Time_ms": t * 1000.0,
+        "Freq_Hz": np.full(n, fs),
+        "Sync": sync,
+    })
+    for side, off in (("L", 0.0), ("R", stride_s / 2)):
+        gcp = np.zeros(n); evt = np.zeros(n)
+        des = np.zeros(n); act = np.zeros(n); pit = np.zeros(n)
+        gcp[out_window] = poison
+        des[out_window] = poison
+        act[out_window] = poison
+        pit[out_window] = poison
+        for i in range(int(dur_s / stride_s)):
+            s = i * stride_s + off
+            e = s + stride_s * 0.62
+            idx = int(np.searchsorted(t, s))
+            if idx >= n or not in_window[idx]:
+                continue
+            peak = 40.0 if s < 6.0 else 60.0
+            sm = (t >= s) & (t < e)
+            rm = (t >= s) & (t < s + stride_s)
+            if sm.any():
+                gcp[sm] = (t[sm] - s) / (stride_s * 0.62)
+                hump = np.sin(np.pi * (t[sm] - s) / (stride_s * 0.62)) * peak
+                act[sm] = hump
+                des[sm] = hump * 1.05
+            if rm.any():
+                pit[rm] = 12.0 * np.sin(2 * np.pi * (t[rm] - s) / stride_s)
+            evt[idx:idx + 2] = 1.0
+        df[f"{side}_GCP"] = gcp
+        df[f"{side}_Event"] = evt
+        df[f"{side}_Phase"] = (gcp > 0.01).astype(float)
+        df[f"{side}_DesForce_N"] = des
+        df[f"{side}_ActForce_N"] = act
+        df[f"{side}_ErrForce_N"] = act - des
+        df[f"{side}_Pitch_deg"] = pit
+    path = str(tmp_path / "Robot_poison_outside.csv")
+    df.to_csv(path, index=False)
+    return path
+
+
+class TestSyncSlicingNoLeakage:
+    """End-to-end: out-of-window samples must NEVER reach the analyzer.
+
+    Builds a recording with a 999 N poison value everywhere outside
+    the two sync windows. If the half-open `[rising, falling)` slice
+    is honored, the analyzer never sees the poison and the per-stride
+    force profile peaks cleanly at 40 N and 60 N.
+    """
+
+    def test_window_0_returns_clean_40n_peak(self, tmp_path):
+        path = _make_poison_outside_csv(tmp_path)
+        res = run_full_analysis(path, window_idx=0)
+        peak = float(np.max(res.left_force_profile.mean))
+        assert peak < 100.0, f"poison leaked into window 0 (peak={peak:.1f})"
+        assert 35.0 < peak < 45.0, f"window 0 peak {peak:.1f} N not near 40 N"
+
+    def test_window_1_returns_clean_60n_peak(self, tmp_path):
+        path = _make_poison_outside_csv(tmp_path)
+        res = run_full_analysis(path, window_idx=1)
+        peak = float(np.max(res.left_force_profile.mean))
+        assert peak < 100.0, f"poison leaked into window 1 (peak={peak:.1f})"
+        assert 55.0 < peak < 65.0, f"window 1 peak {peak:.1f} N not near 60 N"
+
+    def test_force_tracking_rmse_stays_small_in_each_window(self, tmp_path):
+        """RMSE between Des and Act in either window should be a few
+        Newtons (Des is 1.05 × Act). A leak would drive RMSE > 100."""
+        path = _make_poison_outside_csv(tmp_path)
+        for w in (0, 1):
+            res = run_full_analysis(path, window_idx=w)
+            rmse = float(res.left_force_tracking.rmse)
+            assert rmse < 50.0, (
+                f"window {w} RMSE {rmse:.1f} N — poison leaked into "
+                f"force_tracking"
+            )

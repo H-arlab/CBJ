@@ -277,3 +277,114 @@ def test_align_three_sources():
         window_idx=0, target_fs=500.0,
     )
     assert set(aligned.grids.keys()) == {"robot", "motion", "emg"}
+
+
+# ============================================================
+# Half-open boundary + multi-window edge cases
+#   The contract is `[rising, falling)` — rising IS in the window,
+#   falling sample is NOT. These tests pin every corner so a future
+#   refactor that drops one sample at the start (off-by-one) or
+#   includes the falling sample (closes the interval) turns red.
+# ============================================================
+
+def _df_from_sync(values: list[int], fs: float = 100.0) -> pd.DataFrame:
+    n = len(values)
+    return pd.DataFrame({"Time_s": np.arange(n) / fs,
+                         "Sync": np.asarray(values, dtype=float)})
+
+
+class TestHalfOpenBoundary:
+    def test_falling_sample_is_excluded(self):
+        """The sample at sample_falling must hold a LOW value."""
+        df = _df_from_sync([0, 0, 1, 1, 1, 0, 0])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 1
+        # Slice covers indices 2,3,4 — all HIGH; index 5 (falling) is LOW.
+        assert ws[0].sample_rising == 2
+        assert ws[0].sample_falling == 5
+        assert df["Sync"].iat[5] == 0.0
+
+    def test_rising_sample_is_included(self):
+        """The sample at sample_rising must hold a HIGH value."""
+        df = _df_from_sync([0, 0, 1, 1, 1, 0, 0])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert df["Sync"].iat[ws[0].sample_rising] == 1.0
+
+    def test_extract_slice_contains_only_high_samples(self):
+        df = _df_from_sync([0, 1, 1, 1, 0, 0, 1, 1, 0])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        for w in ws:
+            sub = sync_align.extract_window_slice(df, w)
+            assert (sub["Sync"] > 0.5).all(), (
+                f"window {w.index} slice contains LOW sample(s) — "
+                f"half-open contract violated"
+            )
+
+    def test_single_sample_window_supported(self):
+        """A 1-sample HIGH pulse → 1-sample slice."""
+        df = _df_from_sync([0, 0, 1, 0, 0])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 1
+        assert ws[0].sample_falling - ws[0].sample_rising == 1
+        sub = sync_align.extract_window_slice(df, ws[0])
+        assert len(sub) == 1
+        assert sub["Sync"].iat[0] == 1.0
+
+
+class TestMultiWindowDistinguishability:
+    def test_three_windows_have_disjoint_slices(self):
+        df = _df_from_sync(
+            [0, 0, 1, 1, 0,  1, 1, 1, 1, 0,  0, 1, 1, 1, 1, 1, 0,  0, 0]
+        )
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 3
+        idxs = sorted([(w.sample_rising, w.sample_falling) for w in ws])
+        assert idxs == [(2, 4), (5, 9), (11, 16)]
+        # Every pair of windows has zero sample overlap.
+        for i in range(len(ws)):
+            for j in range(i + 1, len(ws)):
+                a = set(range(ws[i].sample_rising, ws[i].sample_falling))
+                b = set(range(ws[j].sample_rising, ws[j].sample_falling))
+                assert not (a & b), (
+                    f"windows {i} and {j} overlap at samples {a & b}"
+                )
+
+    def test_adjacent_windows_with_one_sample_gap(self):
+        """Two pulses separated by a single LOW sample must still be
+        emitted as two distinct windows (no merging)."""
+        df = _df_from_sync([0, 1, 1, 0, 1, 1, 1, 0, 0])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 2
+        assert ws[0].sample_falling <= ws[1].sample_rising
+
+    def test_unclosed_trailing_pulse_dropped(self):
+        """Rising edge at the tail with no closing falling → that
+        pulse is incomplete and must be dropped, never returned."""
+        df = _df_from_sync([0, 1, 1, 0, 0, 1, 1, 1])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 1, (
+            "incomplete trailing pulse must be dropped per CLAUDE.md spec"
+        )
+        assert ws[0].sample_falling == 3
+
+    def test_born_high_recording_drops_the_pre_window(self):
+        """Recording that starts already HIGH → the leading 'window'
+        with no rising edge must be dropped; only the proper
+        rising→falling pulse later in the file is returned."""
+        df = _df_from_sync([1, 1, 1, 0, 0, 1, 1, 0])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 1
+        assert ws[0].sample_rising == 5
+
+    def test_each_falling_paired_only_once(self):
+        """Two risings must each pair with their **own** falling, not
+        share one. Used-falling guard prevents double-pairing."""
+        df = _df_from_sync(
+            [0, 1, 1, 0,  1, 1, 1, 0,  1, 1, 0]
+        )
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 3
+        falling_samples = [w.sample_falling for w in ws]
+        assert len(set(falling_samples)) == 3, (
+            f"duplicate falling-edge pairing: {falling_samples}"
+        )
