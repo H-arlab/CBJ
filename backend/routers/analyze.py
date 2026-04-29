@@ -267,12 +267,24 @@ def analyze(ds_id: str, window: int = 0) -> dict[str, Any]:
 
 
 @router.get("/{ds_id}/windows")
-def list_windows(ds_id: str) -> dict[str, Any]:
+def list_windows(
+    ds_id: str,
+    min_duration_s: float = 0.5,
+    include_phantom: bool = False,
+) -> dict[str, Any]:
     """List every sync window in a dataset with per-trial metadata.
 
     Light-weight probe — runs the rising/falling edge detector but
     not the full analyzer. Use this to populate a trial picker in the
     UI before deciding which window(s) to analyze.
+
+    Phantom-pulse filtering:
+      `min_duration_s` (default 0.5 s) drops sub-threshold pulses
+      caused by file-IO toggling the sync line. Set to 0.0 to keep
+      every detected pulse; set higher for noisier hardware.
+      `include_phantom=true` returns BOTH the surviving windows and
+      the dropped phantoms (in `phantoms[]`) so the inspector UI can
+      surface what was filtered without losing visibility.
     """
     path = get_path(ds_id)
     if not path:
@@ -282,21 +294,33 @@ def list_windows(ds_id: str) -> dict[str, Any]:
         df = pd.read_csv(path)
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"CSV unreadable: {exc}") from exc
-    windows = find_sync_windows(df)
-    return {
+
+    def _serialize(w):
+        return {
+            "idx": w.index,
+            "t_rise_s": float(w.rising_t_s),
+            "t_fall_s": float(w.falling_t_s),
+            "duration_s": float(w.duration_s),
+            "n_samples": int(w.sample_falling - w.sample_rising),
+        }
+
+    windows = find_sync_windows(df, min_duration_s=min_duration_s)
+    payload: dict[str, Any] = {
         "ds_id": ds_id,
+        "min_duration_s": float(min_duration_s),
         "n_windows": len(windows),
-        "windows": [
-            {
-                "idx": w.index,
-                "t_rise_s": float(w.rising_t_s),
-                "t_fall_s": float(w.falling_t_s),
-                "duration_s": float(w.duration_s),
-                "n_samples": int(w.sample_falling - w.sample_rising),
-            }
-            for w in windows
-        ],
+        "windows": [_serialize(w) for w in windows],
     }
+    if include_phantom:
+        all_pulses = find_sync_windows(df, min_duration_s=0.0)
+        survivor_keys = {(w.sample_rising, w.sample_falling) for w in windows}
+        phantoms = [
+            _serialize(w) for w in all_pulses
+            if (w.sample_rising, w.sample_falling) not in survivor_keys
+        ]
+        payload["phantoms"] = phantoms
+        payload["n_phantoms"] = len(phantoms)
+    return payload
 
 
 @router.delete("/{ds_id}/cache")

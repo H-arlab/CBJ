@@ -62,10 +62,19 @@ class WindowsResponse(BaseModel):
 
 
 @router.get("/{ds_id}/windows", response_model=WindowsResponse)
-def list_windows(ds_id: str) -> WindowsResponse:
+def list_windows(
+    ds_id: str,
+    min_duration_s: float = 0.5,
+) -> WindowsResponse:
+    """List operator-driven sync windows.
+
+    `min_duration_s` (default 0.5 s) drops phantom pulses caused by
+    file-IO toggling the sync line. Set to 0.0 to see every detected
+    edge for hardware debugging.
+    """
     df = _read_df(ds_id)
     sync_col = sync_align._find_sync_column(df)
-    wins = sync_align.find_sync_windows(df)
+    wins = sync_align.find_sync_windows(df, min_duration_s=min_duration_s)
     return WindowsResponse(
         dataset_id=ds_id,
         sync_column=sync_col,

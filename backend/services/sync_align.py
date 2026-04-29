@@ -133,8 +133,27 @@ class SyncWindow:
 # Window detection
 # ------------------------------------------------------------
 
+"""Default minimum trial duration (seconds).
+
+Pulses shorter than this are treated as **phantom pulses** rather than
+real operator-driven trials. The H-Walker DAQ shares a sync GPIO line
+with the recording software's New-File / Save-File handlers, and those
+file-IO events can briefly toggle the line for a few milliseconds. A
+real trial is at least a few gait cycles (a stride is ~1 s), so 0.5 s
+cleanly separates the two regimes:
+
+    duration < 0.5 s  → phantom pulse, dropped
+    duration ≥ 0.5 s  → real trial, kept
+
+Override per-call via the `min_duration_s` argument when you need to
+see *every* edge (e.g. debugging the recording line itself).
+"""
+DEFAULT_MIN_WINDOW_DURATION_S = 0.5
+
+
 def find_sync_windows(df: pd.DataFrame,
                       sync_col: Optional[str] = None,
+                      min_duration_s: float = DEFAULT_MIN_WINDOW_DURATION_S,
                       ) -> list[SyncWindow]:
     """Return every rising→falling sync window in the DataFrame.
 
@@ -143,11 +162,18 @@ def find_sync_windows(df: pd.DataFrame,
          (0/1) and analog (TTL ramp) signals both work.
       2. Find all rising-edge sample indices.
       3. For each rising edge, find the **next** falling-edge sample.
-      4. Emit the [rising, falling] pair as one SyncWindow.
+      4. Emit the [rising, falling) pair as one SyncWindow.
+      5. Drop any window narrower than `min_duration_s` — these are
+         phantom pulses caused by file-IO toggling the sync line, not
+         real operator-driven trials. Default 0.5 s.
 
     A trailing rising edge with no closing falling edge is dropped
     (incomplete window — the operator never released the button or
     the recording stopped mid-trial).
+
+    Pass `min_duration_s=0.0` to keep every detected pulse, including
+    millisecond glitches — useful when you want to see the raw line
+    behaviour for debugging, but never the right setting for analysis.
     """
     sync_col = sync_col or _find_sync_column(df)
     if sync_col is None or sync_col not in df.columns:
@@ -175,7 +201,7 @@ def find_sync_windows(df: pd.DataFrame,
     if rising_local.size == 0 or falling_local.size == 0:
         return []
 
-    windows: list[SyncWindow] = []
+    raw_windows: list[SyncWindow] = []
     used_falling = 0
     for r_local in rising_local:
         # First falling edge AFTER this rising edge that we haven't
@@ -186,14 +212,41 @@ def find_sync_windows(df: pd.DataFrame,
             break
         f_local = cands[0]
         used_falling = int(np.where(falling_local == f_local)[0][0]) + 1
-        windows.append(SyncWindow(
-            index=len(windows),
+        raw_windows.append(SyncWindow(
+            index=len(raw_windows),
             rising_t_s=float(t_finite[r_local]),
             falling_t_s=float(t_finite[f_local]),
             sample_rising=int(finite_idx[r_local]),
             sample_falling=int(finite_idx[f_local]),
         ))
-    return windows
+
+    # Phantom-pulse rejection: drop any window narrower than the
+    # configured minimum and re-index so the surviving windows are
+    # numbered 0..N-1 contiguously (downstream code uses .index as a
+    # consecutive trial id).
+    if min_duration_s <= 0:
+        return raw_windows
+    survivors = [w for w in raw_windows if w.duration_s >= min_duration_s]
+    return [
+        SyncWindow(
+            index=i,
+            rising_t_s=w.rising_t_s,
+            falling_t_s=w.falling_t_s,
+            sample_rising=w.sample_rising,
+            sample_falling=w.sample_falling,
+        )
+        for i, w in enumerate(survivors)
+    ]
+
+
+def find_sync_windows_raw(df: pd.DataFrame,
+                          sync_col: Optional[str] = None,
+                          ) -> list[SyncWindow]:
+    """Return every rising→falling pair, including sub-`min_duration`
+    phantom pulses. Use this when the caller needs to *see* the
+    glitches (e.g. the inspector UI showing the user that 3 short
+    spikes were dropped before analysis)."""
+    return find_sync_windows(df, sync_col, min_duration_s=0.0)
 
 
 # ------------------------------------------------------------
@@ -288,6 +341,7 @@ def align_sources_on_window(
     window_idx: int = 0,
     target_fs: float = 1000.0,
     columns_per_source: Optional[dict[str, list[str]]] = None,
+    min_duration_s: float = DEFAULT_MIN_WINDOW_DURATION_S,
 ) -> AlignedSources:
     """Align several sources on the **same sync-window index** within
     each source.
@@ -303,6 +357,9 @@ def align_sources_on_window(
     has no Sync) is skipped with a warning; its grid is omitted from
     the result. Callers should check `warnings` and either retry with
     a different window or treat that source as unaligned.
+
+    `min_duration_s` is forwarded to `find_sync_windows` so phantom
+    pulses are filtered identically across sources.
     """
     if not sources:
         raise ValueError("at least one source required")
@@ -312,7 +369,7 @@ def align_sources_on_window(
     win_per_src: dict[str, Optional[SyncWindow]] = {}
 
     for src_id, df in sources.items():
-        windows = find_sync_windows(df)
+        windows = find_sync_windows(df, min_duration_s=min_duration_s)
         if not windows:
             warnings.append(
                 f"{src_id}: no sync window found — source skipped from alignment"

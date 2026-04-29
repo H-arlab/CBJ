@@ -220,6 +220,10 @@ def count_sync_windows(filepath: str) -> int:
     detector, no full analysis. Returns 1 when there's no Sync
     column or no detectable windows (the analyzer treats that as a
     single-trial fallback, so callers can use this count directly).
+
+    Phantom pulses (e.g. file-IO glitches narrower than 0.5 s) are
+    filtered out by `find_sync_windows`'s default threshold so this
+    count reflects real operator-driven trials only.
     """
     import pandas as pd
     from backend.services.sync_align import find_sync_windows

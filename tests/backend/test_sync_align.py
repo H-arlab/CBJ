@@ -103,7 +103,10 @@ def test_no_sync_column_yields_no_windows():
 
 def test_handles_analog_sync_via_threshold():
     """Sync that ramps (analog TTL) — threshold at midpoint must
-    still produce one window per pulse."""
+    still produce one window per pulse. Pulses are 0.4 s here to
+    cover the analog-detection mechanic; pass min_duration_s=0.0 so
+    the phantom-pulse filter doesn't drop them — this test isn't
+    about phantom rejection."""
     fs = 1000.0
     n = 5000
     t = np.arange(n) / fs
@@ -112,7 +115,7 @@ def test_handles_analog_sync_via_threshold():
     for start in (0.5, 1.5, 2.5):
         sync[(t >= start) & (t < start + 0.4)] = 5.0  # analog scale
     df = _df(sync, fs)
-    wins = sync_align.find_sync_windows(df)
+    wins = sync_align.find_sync_windows(df, min_duration_s=0.0)
     assert len(wins) == 3
 
 
@@ -249,13 +252,16 @@ def test_align_warns_for_unsync_source_but_continues_with_synced():
 def test_align_uses_shortest_window_duration():
     """Grid range = min(window_durations). Source with shorter window
     determines the analysis range, longer source's window gets
-    truncated."""
+    truncated. Use `min_duration_s=0.0` so the 100 ms test window
+    isn't filtered as a phantom — this test is about alignment
+    range, not phantom rejection."""
     fs = 100.0
     a = _df(_sync_with_windows(500, fs, [(0.5, 0.6)]), fs)   # 100 ms window
     b = _df(_sync_with_windows(2000, fs, [(0.5, 5.0)]), fs)  # 4.5 s window
     aligned = sync_align.align_sources_on_window(
         {"a": a, "b": b},
         window_idx=0, target_fs=500.0,
+        min_duration_s=0.0,
     )
     # t_max should be ~0.1 s (the shorter window), not 4.5 s.
     assert 0.05 < aligned.t_max_s < 0.15
@@ -294,10 +300,16 @@ def _df_from_sync(values: list[int], fs: float = 100.0) -> pd.DataFrame:
 
 
 class TestHalfOpenBoundary:
+    """These tests probe raw detection mechanics — half-open boundary,
+    rising/falling sample inclusion. The synthetic signals are tens
+    of samples long (well below the phantom-filter default of 0.5 s),
+    so they call `find_sync_windows_raw` to bypass duration filtering.
+    Phantom-pulse filtering itself is covered in TestPhantomPulseFilter.
+    """
     def test_falling_sample_is_excluded(self):
         """The sample at sample_falling must hold a LOW value."""
         df = _df_from_sync([0, 0, 1, 1, 1, 0, 0])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 1
         # Slice covers indices 2,3,4 — all HIGH; index 5 (falling) is LOW.
         assert ws[0].sample_rising == 2
@@ -307,12 +319,12 @@ class TestHalfOpenBoundary:
     def test_rising_sample_is_included(self):
         """The sample at sample_rising must hold a HIGH value."""
         df = _df_from_sync([0, 0, 1, 1, 1, 0, 0])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert df["Sync"].iat[ws[0].sample_rising] == 1.0
 
     def test_extract_slice_contains_only_high_samples(self):
         df = _df_from_sync([0, 1, 1, 1, 0, 0, 1, 1, 0])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         for w in ws:
             sub = sync_align.extract_window_slice(df, w)
             assert (sub["Sync"] > 0.5).all(), (
@@ -323,7 +335,7 @@ class TestHalfOpenBoundary:
     def test_single_sample_window_supported(self):
         """A 1-sample HIGH pulse → 1-sample slice."""
         df = _df_from_sync([0, 0, 1, 0, 0])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 1
         assert ws[0].sample_falling - ws[0].sample_rising == 1
         sub = sync_align.extract_window_slice(df, ws[0])
@@ -332,11 +344,13 @@ class TestHalfOpenBoundary:
 
 
 class TestMultiWindowDistinguishability:
+    """Same disclaimer as TestHalfOpenBoundary — these tests verify
+    rising-to-falling pairing logic, not duration filtering."""
     def test_three_windows_have_disjoint_slices(self):
         df = _df_from_sync(
             [0, 0, 1, 1, 0,  1, 1, 1, 1, 0,  0, 1, 1, 1, 1, 1, 0,  0, 0]
         )
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 3
         idxs = sorted([(w.sample_rising, w.sample_falling) for w in ws])
         assert idxs == [(2, 4), (5, 9), (11, 16)]
@@ -353,7 +367,7 @@ class TestMultiWindowDistinguishability:
         """Two pulses separated by a single LOW sample must still be
         emitted as two distinct windows (no merging)."""
         df = _df_from_sync([0, 1, 1, 0, 1, 1, 1, 0, 0])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 2
         assert ws[0].sample_falling <= ws[1].sample_rising
 
@@ -361,7 +375,7 @@ class TestMultiWindowDistinguishability:
         """Rising edge at the tail with no closing falling → that
         pulse is incomplete and must be dropped, never returned."""
         df = _df_from_sync([0, 1, 1, 0, 0, 1, 1, 1])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 1, (
             "incomplete trailing pulse must be dropped per CLAUDE.md spec"
         )
@@ -372,7 +386,7 @@ class TestMultiWindowDistinguishability:
         with no rising edge must be dropped; only the proper
         rising→falling pulse later in the file is returned."""
         df = _df_from_sync([1, 1, 1, 0, 0, 1, 1, 0])
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 1
         assert ws[0].sample_rising == 5
 
@@ -382,9 +396,108 @@ class TestMultiWindowDistinguishability:
         df = _df_from_sync(
             [0, 1, 1, 0,  1, 1, 1, 0,  1, 1, 0]
         )
-        ws = sync_align.find_sync_windows(df, "Sync")
+        ws = sync_align.find_sync_windows_raw(df, "Sync")
         assert len(ws) == 3
         falling_samples = [w.sample_falling for w in ws]
         assert len(set(falling_samples)) == 3, (
             f"duplicate falling-edge pairing: {falling_samples}"
         )
+
+
+# ============================================================
+# Phantom-pulse rejection
+#   The sync GPIO line on the H-Walker DAQ is shared with file-IO
+#   handlers in the recording software. New File / Save File events
+#   briefly toggle the line for milliseconds, producing fake "trial"
+#   pulses that must NOT reach the analyzer. find_sync_windows takes
+#   a min_duration_s threshold (default 0.5 s) that drops sub-
+#   threshold pulses.
+# ============================================================
+
+def _df_with_pulses_at_seconds(pulses_s: list[tuple[float, float]],
+                               fs: float = 1000.0,
+                               total_s: float = 12.0) -> pd.DataFrame:
+    """Build a DataFrame with explicit pulse intervals in seconds."""
+    n = int(total_s * fs)
+    t = np.arange(n) / fs
+    sync = np.zeros(n, dtype=float)
+    for r, f in pulses_s:
+        sync[(t >= r) & (t < f)] = 1.0
+    return pd.DataFrame({"Time_s": t, "Sync": sync})
+
+
+class TestPhantomPulseFilter:
+    def test_default_drops_phantom_pulses(self):
+        """One real 4 s trial + three 10 ms phantom glitches. Default
+        threshold (0.5 s) keeps only the trial."""
+        df = _df_with_pulses_at_seconds([
+            (0.50, 0.51),    # phantom 10 ms — file IO
+            (1.00, 5.00),    # REAL trial 4 s
+            (6.00, 6.005),   # phantom 5 ms
+            (7.50, 7.515),   # phantom 15 ms
+        ])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 1
+        assert ws[0].duration_s == pytest.approx(4.0, abs=0.01)
+
+    def test_zero_threshold_keeps_every_pulse(self):
+        """min_duration_s=0.0 → no filtering, returns every pulse."""
+        df = _df_with_pulses_at_seconds([
+            (0.50, 0.51), (1.00, 5.00), (6.00, 6.005), (7.50, 7.515),
+        ])
+        ws = sync_align.find_sync_windows(df, "Sync", min_duration_s=0.0)
+        assert len(ws) == 4
+
+    def test_indices_reassigned_after_filter(self):
+        """When phantoms surround the real trial, the surviving
+        window must be reindexed to 0 — downstream code uses .index
+        as a contiguous trial id."""
+        df = _df_with_pulses_at_seconds([
+            (0.10, 0.12),   # phantom — would have idx 0 raw
+            (1.00, 5.00),   # REAL — would have idx 1 raw
+            (8.00, 8.05),   # phantom — would have idx 2 raw
+        ])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 1
+        assert ws[0].index == 0, (
+            "surviving real trial must be reindexed to 0; got "
+            f"index={ws[0].index}"
+        )
+
+    def test_threshold_higher_than_real_trial_returns_empty(self):
+        """If the user sets min_duration_s above the real trial's
+        width, the trial gets filtered too — explicit signal so the
+        operator can debug an over-aggressive threshold."""
+        df = _df_with_pulses_at_seconds([(1.0, 3.0)])  # 2 s
+        ws = sync_align.find_sync_windows(df, "Sync", min_duration_s=5.0)
+        assert ws == []
+
+    def test_raw_helper_ignores_threshold(self):
+        df = _df_with_pulses_at_seconds([
+            (0.50, 0.51), (1.00, 5.00), (6.00, 6.005),
+        ])
+        raw = sync_align.find_sync_windows_raw(df, "Sync")
+        assert len(raw) == 3
+
+    def test_two_real_trials_with_phantoms_between(self):
+        """The realistic case: two operator-driven trials with file-
+        IO phantoms scattered between/around them."""
+        df = _df_with_pulses_at_seconds([
+            (0.10, 0.12),   # phantom (file open)
+            (1.00, 5.00),   # REAL trial 0 (4 s)
+            (5.20, 5.22),   # phantom (auto-save)
+            (7.00, 11.00),  # REAL trial 1 (4 s)
+            (11.50, 11.51), # phantom (file close)
+        ])
+        ws = sync_align.find_sync_windows(df, "Sync")
+        assert len(ws) == 2
+        assert [w.index for w in ws] == [0, 1]
+        # Durations clearly > threshold, in expected ranges
+        assert all(3.5 < w.duration_s < 4.5 for w in ws)
+
+    def test_threshold_exactly_at_pulse_width_keeps_pulse(self):
+        """Boundary: a pulse exactly at the threshold survives
+        (`>=` comparison, not strict >)."""
+        df = _df_with_pulses_at_seconds([(1.0, 1.5)], fs=1000.0)  # 0.5s
+        ws = sync_align.find_sync_windows(df, "Sync", min_duration_s=0.5)
+        assert len(ws) == 1, "0.5 s pulse must survive 0.5 s threshold"

@@ -68,13 +68,22 @@ def _time_axis(df: pd.DataFrame) -> np.ndarray:
     return np.arange(len(df)) / fs
 
 
-def _detect_sync_windows(sync: np.ndarray, t: np.ndarray) -> list[tuple[float, float]]:
-    """Find every sync window = [rising-edge, falling-edge].
+def _detect_sync_windows(
+    sync: np.ndarray,
+    t: np.ndarray,
+    min_duration_s: float = 0.0,
+) -> list[tuple[float, float]]:
+    """Find every sync window = [rising-edge, falling-edge).
 
     Threshold at midpoint(min, max) so digital and analog sync both
     work. For each rising edge, pair with the next falling edge.
     A trailing rising edge with no closing falling edge is dropped
     (incomplete trial — operator never released or recording stopped).
+
+    `min_duration_s` filters phantom pulses (file-IO glitches that
+    briefly toggle the sync line). Defaults to 0.0 here so existing
+    direct callers see every detected pulse — the public endpoint
+    `GET /api/inspector/{id}/syncs` applies a non-zero default itself.
     """
     if sync.size == 0 or not np.isfinite(sync).any():
         return []
@@ -101,6 +110,8 @@ def _detect_sync_windows(sync: np.ndarray, t: np.ndarray) -> list[tuple[float, f
         f = cands[0]
         used_falling = int(np.where(falling == f)[0][0]) + 1
         windows.append((float(t[r]), float(t[f])))
+    if min_duration_s > 0:
+        windows = [(s, e) for (s, e) in windows if (e - s) >= min_duration_s]
     return windows
 
 
@@ -126,7 +137,17 @@ class SyncsResponse(BaseModel):
 
 
 @router.get("/{ds_id}/syncs", response_model=SyncsResponse)
-def list_syncs(ds_id: str) -> SyncsResponse:
+def list_syncs(
+    ds_id: str,
+    min_duration_s: float = 0.5,
+) -> SyncsResponse:
+    """List rising→falling sync windows in the recording.
+
+    `min_duration_s` filters phantom pulses caused by file-IO toggling
+    the sync GPIO line. Default 0.5 s drops anything shorter than half
+    a stride. Pass 0.0 to see every detected edge for hardware
+    debugging.
+    """
     df = _read_df(ds_id)
     t = _time_axis(df)
     fs = float(1.0 / np.median(np.diff(t))) if len(t) > 1 else None
@@ -137,7 +158,7 @@ def list_syncs(ds_id: str) -> SyncsResponse:
         )
 
     sync = df["Sync"].to_numpy(dtype=float)
-    windows = _detect_sync_windows(sync, t)
+    windows = _detect_sync_windows(sync, t, min_duration_s=min_duration_s)
     return SyncsResponse(
         column="Sync",
         n_samples=len(df),

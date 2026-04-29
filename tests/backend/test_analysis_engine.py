@@ -400,3 +400,121 @@ class TestSyncSlicingNoLeakage:
                 f"window {w} RMSE {rmse:.1f} N — poison leaked into "
                 f"force_tracking"
             )
+
+
+def _make_phantom_mixed_csv(tmp_path,
+                             fs: float = 111.0,
+                             stride_s: float = 1.05) -> str:
+    """Recording with two REAL trials interleaved with three short
+    phantom pulses (the kind file-IO events produce on the H-Walker
+    sync line). Real trials carry clean stride data; phantoms have
+    POISON values everywhere. If phantom filtering works, only the
+    two real trials reach the analyzer.
+
+    Layout:
+        t=0.10–0.12 s  : phantom (file-open)
+        t=1.00–5.00 s  : REAL trial 0  (peak 40 N)
+        t=5.20–5.22 s  : phantom (auto-save)
+        t=7.00–11.00 s : REAL trial 1  (peak 60 N)
+        t=11.50–11.51s : phantom (file-close)
+    """
+    dur_s = 12.0
+    n = int(dur_s * fs)
+    t = np.arange(n) / fs
+    sync = np.zeros(n)
+    # phantoms (must be < 0.5 s default threshold)
+    sync[(t >= 0.10) & (t < 0.12)] = 1.0
+    sync[(t >= 5.20) & (t < 5.22)] = 1.0
+    sync[(t >= 11.50) & (t < 11.51)] = 1.0
+    # REAL trials (≥ 0.5 s)
+    real_a = (t >= 1.0) & (t < 5.0)
+    real_b = (t >= 7.0) & (t < 11.0)
+    sync[real_a] = 1.0
+    sync[real_b] = 1.0
+
+    in_real = real_a | real_b
+    POISON = 999.0
+    df = pd.DataFrame({
+        "Time_ms": t * 1000.0,
+        "Freq_Hz": np.full(n, fs),
+        "Sync": sync,
+    })
+    for side, off in (("L", 0.0), ("R", stride_s / 2)):
+        gcp = np.zeros(n); evt = np.zeros(n)
+        des = np.zeros(n); act = np.zeros(n); pit = np.zeros(n)
+        # Outside REAL trials: poison so any leak is observable.
+        gcp[~in_real] = POISON
+        des[~in_real] = POISON
+        act[~in_real] = POISON
+        pit[~in_real] = POISON
+        for i in range(int(dur_s / stride_s)):
+            s = i * stride_s + off
+            e = s + stride_s * 0.62
+            idx = int(np.searchsorted(t, s))
+            if idx >= n or not in_real[idx]:
+                continue
+            peak = 40.0 if s < 6.0 else 60.0
+            sm = (t >= s) & (t < e)
+            rm = (t >= s) & (t < s + stride_s)
+            if sm.any():
+                gcp[sm] = (t[sm] - s) / (stride_s * 0.62)
+                hump = np.sin(np.pi * (t[sm] - s) / (stride_s * 0.62)) * peak
+                act[sm] = hump
+                des[sm] = hump * 1.05
+            if rm.any():
+                pit[rm] = 12.0 * np.sin(2 * np.pi * (t[rm] - s) / stride_s)
+            evt[idx:idx + 2] = 1.0
+        df[f"{side}_GCP"] = gcp
+        df[f"{side}_Event"] = evt
+        df[f"{side}_Phase"] = (gcp > 0.01).astype(float)
+        df[f"{side}_DesForce_N"] = des
+        df[f"{side}_ActForce_N"] = act
+        df[f"{side}_ErrForce_N"] = act - des
+        df[f"{side}_Pitch_deg"] = pit
+    path = str(tmp_path / "Robot_phantom_mixed.csv")
+    df.to_csv(path, index=False)
+    return path
+
+
+class TestPhantomPulseEndToEnd:
+    """End-to-end: phantoms must NEVER show up as analyzable trials."""
+
+    def test_count_excludes_phantom_pulses(self, tmp_path):
+        path = _make_phantom_mixed_csv(tmp_path)
+        # Five raw pulses, two of which are real → count is 2.
+        assert count_sync_windows(path) == 2
+
+    def test_per_window_returns_only_real_trials(self, tmp_path):
+        path = _make_phantom_mixed_csv(tmp_path)
+        results = run_per_window_analysis(path)
+        assert len(results) == 2, (
+            "phantom pulses must not be returned as trials; got "
+            f"{len(results)} results"
+        )
+
+    def test_default_window_is_real_trial_zero(self, tmp_path):
+        path = _make_phantom_mixed_csv(tmp_path)
+        res = run_full_analysis(path, window_idx=0)
+        assert res.sync_window_t_rise_s == pytest.approx(1.0, abs=0.05), (
+            f"default window 0 should be the first REAL trial (t=1.0s), "
+            f"got t={res.sync_window_t_rise_s:.3f}s — phantom may have "
+            f"slipped through"
+        )
+        peak = float(np.max(res.left_force_profile.mean))
+        assert 35.0 < peak < 45.0
+        assert peak < 100.0   # no poison leak
+
+    def test_window_one_is_second_real_trial(self, tmp_path):
+        path = _make_phantom_mixed_csv(tmp_path)
+        res = run_full_analysis(path, window_idx=1)
+        assert res.sync_window_t_rise_s == pytest.approx(7.0, abs=0.05)
+        peak = float(np.max(res.left_force_profile.mean))
+        assert 55.0 < peak < 65.0
+        assert peak < 100.0   # no poison leak
+
+    def test_addressing_phantom_index_raises(self, tmp_path):
+        """Trying to address a phantom (e.g. index 2 in 5-pulse raw) is
+        out of range after filtering, since count_sync_windows returns 2."""
+        path = _make_phantom_mixed_csv(tmp_path)
+        with pytest.raises(IndexError):
+            run_full_analysis(path, window_idx=2)
