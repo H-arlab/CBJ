@@ -158,6 +158,16 @@ def parse(filename: str) -> Optional[ParsedFilename]:
         # metadata.
         return None
 
+    # Normalize subject so `s1`, `s01`, `S01` all collapse to the
+    # same two-digit canonical form (`s01`). trial_idx already
+    # collapses through int(); the subject token is the only other
+    # place where zero-padding could cause Robot+Motion+Loadcell
+    # pairing to silently drop matches. Two-digit form chosen so the
+    # existing fixture filenames (`s01`) remain canonical.
+    subject_raw = m.group("subject").lower()
+    subject_num = re.search(r"\d+", subject_raw)
+    subject = f"s{int(subject_num.group()):02d}" if subject_num else subject_raw
+
     return ParsedFilename(
         source_prefix=(m.group("source_prefix") or "robot").lower(),  # type: ignore[arg-type]
         date=m.group("date"),
@@ -165,10 +175,10 @@ def parse(filename: str) -> Optional[ParsedFilename]:
         terrain=m.group("terrain"),
         speed_mps=float(m.group("speed")),
         project=m.group("project"),
-        subject=m.group("subject").lower(),
+        subject=subject,
         feat1=feat1,
         feat2=feat2,
-        trial_idx=int(m.group("trial")),
+        trial_idx=int(m.group("trial")),  # int() collapses 01==1==001
         raw=base,
     )
 

@@ -9,6 +9,7 @@ import FocusOverlay from './components/FocusOverlay';
 import Drawer from './components/Drawer';
 import Toast from './components/Toast';
 import GlobalDropZone from './components/GlobalDropZone';
+import ErrorBoundary from './components/ErrorBoundary';
 
 export default function App() {
   const closeDrawer = usePage((s) => s.closeDrawer);
@@ -33,24 +34,26 @@ export default function App() {
   }, [closeDrawer, closeMapper, focusCell]);
 
   return (
-    <div className="app">
-      <TopNav />
-      <Sidebar />
-      <div className="workarea">
-        <PublicationBar />
-        <Canvas />
+    <ErrorBoundary>
+      <div className="app">
+        <TopNav />
+        <Sidebar />
+        <div className="workarea">
+          <PublicationBar />
+          <Canvas />
+        </div>
+        <aside className="chat-rail">
+          <Library />
+        </aside>
+        <div className="footer">
+          <span>H-WALKER CORE · v3</span>
+          <span>PRETENDARD · JETBRAINS MONO</span>
+        </div>
+        <FocusOverlay />
+        <Drawer />
+        <Toast />
+        <GlobalDropZone />
       </div>
-      <aside className="chat-rail">
-        <Library />
-      </aside>
-      <div className="footer">
-        <span>H-WALKER CORE · v3</span>
-        <span>PRETENDARD · JETBRAINS MONO</span>
-      </div>
-      <FocusOverlay />
-      <Drawer />
-      <Toast />
-      <GlobalDropZone />
-    </div>
+    </ErrorBoundary>
   );
 }

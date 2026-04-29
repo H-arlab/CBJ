@@ -70,6 +70,7 @@ def _suggest_filename(req: RenderRequest, P) -> str:
 REAL_DATA_TEMPLATES = {
     # Force / kinetic
     "force", "force_avg", "force_lr_subplot", "asymmetry", "trials",
+    "force_tracking_L", "force_tracking_R",
     # Motion / kinematic
     "imu_avg", "cyclogram", "stride_time_trend",
     "stance_swing_bar", "rom_bar", "symmetry_radar",
@@ -368,6 +369,52 @@ def _render_real_data(req: RenderRequest) -> tuple[bytes, str] | None:
         # manuscript. Only draw a title if the user explicitly provided one.
         return render_from_traces(
             traces, title=req.title or "", x_label="Gait cycle (%)", y_label="Force (N)",
+            preset=req.preset, variant=req.variant, format=req.format,
+            dpi=req.dpi, colorblind_safe=req.colorblind_safe, legend=True,
+        )
+
+    if req.template in ("force_tracking_L", "force_tracking_R"):
+        # Per-side controller-tracking plot — the canonical "did the
+        # robot follow the desired force" figure for cable-driven
+        # assist devices. Three layers on a GCP-normalized axis:
+        #   - Desired   : dashed light line (commanded force)
+        #   - Actual    : solid bold line (measured cable force)
+        #   - Residual  : faint band Actual ± |Actual − Desired|
+        #     (visualizes where tracking error concentrates within
+        #      the gait cycle, e.g. early stance vs push-off)
+        side = "L" if req.template == "force_tracking_L" else "R"
+        side_label = "Left" if side == "L" else "Right"
+        actual_color = "#1E5F9E" if side == "L" else "#9E3838"
+        desired_color = "#7FB5E4" if side == "L" else "#E89B9B"
+        residual_color = "#F09708"
+        fp = res.left_force_profile if side == "L" else res.right_force_profile
+        if fp.mean is None or fp.des_mean is None:
+            return None
+        mean = _np.asarray(fp.mean)
+        des  = _np.asarray(fp.des_mean)
+        n = min(len(mean), len(des), len(gcp_axis))
+        x = gcp_axis[:n]
+        mean = mean[:n]
+        des  = des[:n]
+        residual = mean - des
+        # Faint band above and below the actual trace, width = |residual|
+        traces.append(Trace(kind="band", name="Tracking error",
+                            x=x,
+                            y=list(mean),
+                            y_upper=list(mean + _np.abs(residual)),
+                            y_lower=list(mean - _np.abs(residual)),
+                            color=residual_color, opacity=0.18))
+        traces.append(Trace(kind="line", name=f"{side} Desired",
+                            x=x, y=list(des),
+                            color=desired_color, width=1.3, dash=True))
+        traces.append(Trace(kind="line", name=f"{side} Actual",
+                            x=x, y=list(mean),
+                            color=actual_color, width=2.0))
+        return render_from_traces(
+            traces,
+            title=req.title or "",
+            x_label="Gait cycle (%)",
+            y_label=f"{side_label} cable force (N)",
             preset=req.preset, variant=req.variant, format=req.format,
             dpi=req.dpi, colorblind_safe=req.colorblind_safe, legend=True,
         )
@@ -714,10 +761,14 @@ def _render_real_data(req: RenderRequest) -> tuple[bytes, str] | None:
 
 @router.post("/render")
 def render_endpoint(req: RenderRequest):
-    if req.template not in GRAPH_SPECS:
+    # Templates may live in either GRAPH_SPECS (svg-spec mock pipeline,
+    # used by no-data preview) or REAL_DATA_TEMPLATES (real-data
+    # renderer in this file). Either is a valid template.
+    known_templates = set(GRAPH_SPECS.keys()) | REAL_DATA_TEMPLATES
+    if req.template not in known_templates:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown template '{req.template}'. Known: {sorted(GRAPH_SPECS.keys())}",
+            detail=f"Unknown template '{req.template}'. Known: {sorted(known_templates)}",
         )
     if req.preset not in JOURNAL_PRESETS:
         raise HTTPException(

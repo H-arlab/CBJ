@@ -501,3 +501,47 @@ class TestPhantomPulseFilter:
         df = _df_with_pulses_at_seconds([(1.0, 1.5)], fs=1000.0)  # 0.5s
         ws = sync_align.find_sync_windows(df, "Sync", min_duration_s=0.5)
         assert len(ws) == 1, "0.5 s pulse must survive 0.5 s threshold"
+
+
+# ============================================================
+# Sync column auto-detection — the user's H-Walker firmware names
+# its sync channel `A7` (analog input 7), not `Sync`. Newer rigs
+# may use `sync_signal` etc. The detector must find all of them.
+# ============================================================
+
+class TestSyncColumnAutoDetect:
+    def test_detects_A7_uppercase(self):
+        df = _df_with_pulses_at_seconds([(1.0, 5.0)])
+        df = df.rename(columns={"Sync": "A7"})
+        ws = sync_align.find_sync_windows(df)
+        assert len(ws) == 1
+        assert sync_align._find_sync_column(df) == "A7"
+
+    def test_detects_a7_lowercase(self):
+        df = _df_with_pulses_at_seconds([(1.0, 5.0)])
+        df = df.rename(columns={"Sync": "a7"})
+        ws = sync_align.find_sync_windows(df)
+        assert len(ws) == 1
+
+    def test_A7_takes_precedence_over_Sync_when_both_present(self):
+        """If both columns exist, A7 wins (firmware-native)."""
+        df = _df_with_pulses_at_seconds([(1.0, 5.0)])
+        df = df.copy()
+        df["A7"] = df["Sync"]   # firmware-native column
+        df["Sync"] = 0.0        # generic column with no pulses
+        assert sync_align._find_sync_column(df) == "A7"
+        ws = sync_align.find_sync_windows(df)
+        assert len(ws) == 1, "should use A7's pulses, not Sync's flat zeros"
+
+    def test_detects_sync_signal_alias(self):
+        df = _df_with_pulses_at_seconds([(1.0, 5.0)])
+        df = df.rename(columns={"Sync": "sync_signal"})
+        assert sync_align._find_sync_column(df) == "sync_signal"
+        ws = sync_align.find_sync_windows(df)
+        assert len(ws) == 1
+
+    def test_returns_empty_when_no_known_sync_column(self):
+        df = _df_with_pulses_at_seconds([(1.0, 5.0)])
+        df = df.rename(columns={"Sync": "random_channel_42"})
+        assert sync_align._find_sync_column(df) is None
+        assert sync_align.find_sync_windows(df) == []

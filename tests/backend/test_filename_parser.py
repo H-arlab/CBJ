@@ -133,3 +133,37 @@ def test_is_canonical():
 
 def test_valid_condition_pairs_count():
     assert len(VALID_CONDITION_PAIRS) == 8
+
+
+# ============================================================
+# Zero-padding robustness — operator may export `s1` or `s01`,
+# `_3.csv` or `_03.csv`, and the three sources of one trial must
+# still pair up. These tests pin that contract.
+# ============================================================
+
+class TestZeroPaddingRobustness:
+    def test_subject_s1_and_s01_collapse_to_canonical_form(self):
+        a = parse("260427_TD_level_1.0_H-Walker_s1_prox_axial_3.csv")
+        b = parse("260427_TD_level_1.0_H-Walker_s01_prox_axial_3.csv")
+        assert a is not None and b is not None
+        assert a.subject == b.subject == "s01"
+
+    def test_trial_idx_3_and_03_collapse(self):
+        a = parse("260427_TD_level_1.0_H-Walker_s01_prox_axial_3.csv")
+        b = parse("260427_TD_level_1.0_H-Walker_s01_prox_axial_03.csv")
+        assert a is not None and b is not None
+        assert a.trial_idx == b.trial_idx == 3
+
+    def test_cell_key_matches_across_padding(self):
+        """The three source CSVs of one trial must share cell_key
+        regardless of zero-padding in the subject or trial fields."""
+        robot = parse("260427_TD_level_1.0_H-Walker_s1_prox_axial_3.csv")
+        motion = parse("Motion_260427_TD_level_1.0_H-Walker_s01_prox_axial_03.csv")
+        loadcell = parse("Loadcell_260427_TD_level_1.0_H-Walker_s01_prox_axial_3.csv")
+        assert robot is not None and motion is not None and loadcell is not None
+        assert robot.cell_key == motion.cell_key == loadcell.cell_key
+
+    def test_capital_S_in_subject_normalizes(self):
+        p = parse("260427_TD_level_1.0_H-Walker_s7_prox_axial_1.csv")
+        assert p is not None
+        assert p.subject == "s07"

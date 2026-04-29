@@ -19,7 +19,7 @@ import hashlib
 import os
 import pickle
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import pandas as pd
@@ -46,22 +46,34 @@ _DISK_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _CACHE_VERSION = 1  # bump when AnalysisResult shape changes
 
 
-def _cache_key(path: str) -> str:
-    """Stable key from CSV content + mtime + size. Avoids re-hashing
-    large files by taking the first 1 MB sample."""
+def _cache_key(path: str, ds_id: Optional[str] = None) -> str:
+    """Stable key derived from the CSV's full content hash.
+
+    Prefer the dataset registry's `_content_hash` (computed over the
+    entire upload at receive time) — this guarantees that overwriting
+    the upload directory with a same-length-different-bytes file still
+    invalidates the cache. Falls back to a streaming SHA-256 of the
+    file when the registry entry isn't available (e.g. cache lookup
+    before the registry has rehydrated).
+    """
+    if ds_id is not None:
+        from backend.services.dataset_registry import _REGISTRY
+        ds = _REGISTRY.get(ds_id)
+        if ds and ds.get("_content_hash"):
+            return f"v{_CACHE_VERSION}_{ds['_content_hash'][:24]}"
     try:
-        stat = os.stat(path)
         h = hashlib.sha256()
-        h.update(f"v{_CACHE_VERSION}|size={stat.st_size}|mtime={int(stat.st_mtime)}|".encode())
+        h.update(f"v{_CACHE_VERSION}|".encode())
         with open(path, "rb") as f:
-            h.update(f.read(1024 * 1024))
-        return h.hexdigest()[:24]
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return f"v{_CACHE_VERSION}_{h.hexdigest()[:24]}"
     except OSError:
         return ""
 
 
-def _disk_load(path: str, window_idx: int) -> tuple[AnalysisResult, dict[str, Any]] | None:
-    key = _cache_key(path)
+def _disk_load(path: str, window_idx: int, ds_id: Optional[str] = None) -> tuple[AnalysisResult, dict[str, Any]] | None:
+    key = _cache_key(path, ds_id)
     if not key:
         return None
     cpath = _DISK_CACHE_DIR / f"{key}_w{window_idx}.pkl"
@@ -74,8 +86,8 @@ def _disk_load(path: str, window_idx: int) -> tuple[AnalysisResult, dict[str, An
         return None
 
 
-def _disk_save(path: str, window_idx: int, res: AnalysisResult, payload: dict[str, Any]) -> None:
-    key = _cache_key(path)
+def _disk_save(path: str, window_idx: int, res: AnalysisResult, payload: dict[str, Any], ds_id: Optional[str] = None) -> None:
+    key = _cache_key(path, ds_id)
     if not key:
         return
     cpath = _DISK_CACHE_DIR / f"{key}_w{window_idx}.pkl"
@@ -181,7 +193,7 @@ def _result_payload(res: AnalysisResult, n_windows: int = 1) -> dict[str, Any]:
 
 
 def analyze_cached(
-    ds_id: str, window_idx: int = 0,
+    ds_id: str, window_idx: int = 0, refresh: bool = False,
 ) -> tuple[AnalysisResult | None, dict[str, Any]]:
     """Return (AnalysisResult, payload) for a single sync window.
 
@@ -191,11 +203,16 @@ def analyze_cached(
 
     Cache hierarchy:
       1. Per-session in-memory (fastest, keyed on (ds_id, window_idx))
-      2. Disk cache keyed by file content hash + window
+      2. Disk cache keyed by full content hash + window
       3. Fresh sync-sliced analysis via auto_analyzer
+
+    `refresh=True` bypasses both caches and forces a re-analysis.
+    Use this when the upload pipeline somehow returned the same
+    ds_id for a CSV the user knows is different — defensive escape
+    hatch.
     """
     cache_key = (ds_id, window_idx)
-    if cache_key in _CACHE:
+    if not refresh and cache_key in _CACHE:
         return _CACHE[cache_key]
 
     path = get_path(ds_id)
@@ -203,10 +220,11 @@ def analyze_cached(
         raise HTTPException(status_code=404, detail=f"dataset '{ds_id}' not found")
 
     # Disk cache — skip the full pipeline when we've seen this file before
-    cached = _disk_load(path, window_idx)
-    if cached is not None:
-        _CACHE[cache_key] = cached
-        return cached
+    if not refresh:
+        cached = _disk_load(path, window_idx, ds_id=ds_id)
+        if cached is not None:
+            _CACHE[cache_key] = cached
+            return cached
 
     try:
         df = pd.read_csv(path, nrows=5)
@@ -242,27 +260,48 @@ def analyze_cached(
 
     payload = _result_payload(res, n_windows=n_windows)
     _CACHE[cache_key] = (res, payload)
-    _disk_save(path, window_idx, res, payload)
+    _disk_save(path, window_idx, res, payload, ds_id=ds_id)
     return res, payload
 
 
 def invalidate_cache(ds_id: str) -> None:
-    """Drop every per-window entry for this dataset."""
+    """Drop every per-window entry for this dataset (in-memory + disk).
+
+    The disk cache is keyed by content hash so a fresh upload of a
+    different file already produces a fresh entry, but the user's
+    "I re-uploaded but still see the old result" complaint also
+    happens when the in-memory cache has a stale entry from earlier
+    in the session — wipe both.
+    """
+    from backend.services.dataset_registry import _REGISTRY
+    ds = _REGISTRY.get(ds_id)
+    chash = ds.get("_content_hash") if ds else None
     for key in list(_CACHE.keys()):
         if key[0] == ds_id:
             _CACHE.pop(key, None)
+    if chash:
+        for cpath in _DISK_CACHE_DIR.glob(f"v{_CACHE_VERSION}_{chash[:24]}_w*.pkl"):
+            try:
+                cpath.unlink()
+            except OSError:
+                pass
 
 
 @router.get("/{ds_id}")
-def analyze(ds_id: str, window: int = 0) -> dict[str, Any]:
+def analyze(
+    ds_id: str,
+    window: int = 0,
+    refresh: bool = False,
+) -> dict[str, Any]:
     """Run or fetch cached H-Walker analysis for one sync window.
 
     Default `window=0` returns the first trial. Use `?window=N` to
-    pick a later trial in the same recording. The response always
-    includes `sync.n_windows` so callers know how many trials are
-    available without a separate probe call.
+    pick a later trial in the same recording. Pass `?refresh=true`
+    to bypass both the in-memory and disk caches and force a fresh
+    analysis — escape hatch when the cache somehow returns stale
+    data despite the content-hash key.
     """
-    _, payload = analyze_cached(ds_id, window_idx=window)
+    _, payload = analyze_cached(ds_id, window_idx=window, refresh=refresh)
     return payload
 
 

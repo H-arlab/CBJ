@@ -39,6 +39,23 @@ export const GRAPH_TPLS: Record<string, GraphTemplate> = {
     yUnit: 'Cable force (N)', xUnit: 'Gait cycle (%)',
     yTicks: ['60', '45', '30', '15', '0'], xTicks: ['0', '25', '50', '75', '100'],
   },
+  // Per-side controller-tracking plots: Desired vs Actual cable force
+  // on the same axis with the residual (Act − Des) shown as a faint
+  // band. This is the canonical "did the robot follow the command"
+  // figure for cable-driven assist devices and is how H-Walker papers
+  // typically present force-tracking quality.
+  force_tracking_L: {
+    ey: 'Force tracking · L (Des vs Act)',
+    title: 'Left cable force — Desired vs Actual (GCP)',
+    yUnit: 'Cable force (N)', xUnit: 'Gait cycle (%)',
+    yTicks: ['60', '45', '30', '15', '0'], xTicks: ['0', '25', '50', '75', '100'],
+  },
+  force_tracking_R: {
+    ey: 'Force tracking · R (Des vs Act)',
+    title: 'Right cable force — Desired vs Actual (GCP)',
+    yUnit: 'Cable force (N)', xUnit: 'Gait cycle (%)',
+    yTicks: ['60', '45', '30', '15', '0'], xTicks: ['0', '25', '50', '75', '100'],
+  },
   asymmetry: {
     ey: 'Asymmetry · per stride', title: 'Asymmetry index across strides',
     yUnit: 'Asymmetry (%)', xUnit: 'Stride #',

@@ -518,3 +518,62 @@ class TestPhantomPulseEndToEnd:
         path = _make_phantom_mixed_csv(tmp_path)
         with pytest.raises(IndexError):
             run_full_analysis(path, window_idx=2)
+
+
+class TestCacheInvalidation:
+    """Regression: re-uploading a *modified* CSV must produce a fresh
+    analysis, not return the previous result. The cache key is keyed
+    on full content hash so different bytes → different key. The
+    `?refresh=true` escape hatch bypasses the cache unconditionally
+    for the rare case the hash collides or the registry is missing
+    a content hash on legacy entries.
+    """
+
+    def test_cache_key_changes_when_content_changes(self, tmp_path):
+        from backend.routers.analyze import _cache_key
+        path_a = str(tmp_path / "a.csv")
+        path_b = str(tmp_path / "b.csv")
+        # Same length but different bytes — the old mtime+size+first1MB
+        # cache would have masked this; the content-hash cache must not.
+        pd.DataFrame({"x": np.arange(1000), "y": np.zeros(1000)}).to_csv(path_a, index=False)
+        pd.DataFrame({"x": np.arange(1000), "y": np.ones(1000)}).to_csv(path_b, index=False)
+        ka = _cache_key(path_a)
+        kb = _cache_key(path_b)
+        assert ka and kb
+        assert ka != kb, "different content must produce different cache keys"
+
+    def test_cache_key_stable_for_same_bytes(self, tmp_path):
+        from backend.routers.analyze import _cache_key
+        path = str(tmp_path / "c.csv")
+        pd.DataFrame({"x": np.arange(500)}).to_csv(path, index=False)
+        k1 = _cache_key(path)
+        # mtime change shouldn't matter (we hash content, not metadata)
+        import os, time
+        time.sleep(0.05)
+        os.utime(path, None)
+        k2 = _cache_key(path)
+        assert k1 == k2
+
+    def test_cache_key_uses_registry_content_hash_when_present(self, tmp_path):
+        """When the registry has a `_content_hash` for the dataset id,
+        the cache key derives from it directly — no need to re-hash
+        on every cache lookup."""
+        from backend.services.dataset_registry import _REGISTRY
+        from backend.routers.analyze import _cache_key
+        path = str(tmp_path / "d.csv")
+        pd.DataFrame({"x": np.arange(100)}).to_csv(path, index=False)
+        ds_id = "ds_test_cache_key"
+        _REGISTRY[ds_id] = {
+            "id": ds_id,
+            "_path": path,
+            "_content_hash": "abc123def456abc123def456abc123def456abc123def456abc123def456",
+        }
+        try:
+            k_with_id = _cache_key(path, ds_id=ds_id)
+            k_without = _cache_key(path, ds_id=None)
+            assert k_with_id != k_without, (
+                "registry content hash should be preferred when ds_id given"
+            )
+            assert "abc123def456" in k_with_id
+        finally:
+            _REGISTRY.pop(ds_id, None)

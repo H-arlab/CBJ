@@ -157,6 +157,7 @@ def robot_dataset(tmp_path, monkeypatch):
 # frontend without a renderer trips this test).
 LIBRARY_GRAPH_TEMPLATES = [
     "force", "force_avg", "force_lr_subplot", "asymmetry",
+    "force_tracking_L", "force_tracking_R",
     "trials", "imu_avg", "cyclogram", "rom_bar",
     "stride_time_trend", "stance_swing_bar", "symmetry_radar",
 ]

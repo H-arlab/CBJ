@@ -58,7 +58,17 @@ import pandas as pd
 
 _TIME_CANDIDATES_S  = ("Time_s", "time_s", "Timestamp", "Time", "time", "T", "t")
 _TIME_CANDIDATES_MS = ("Time_ms", "time_ms")
-_SYNC_CANDIDATES    = ("Sync", "sync", "Trigger", "trigger", "TTL", "ttl")
+# Sync/trigger column candidates. The H-Walker firmware names this
+# `A7` (analog input 7) on the user's hardware; older builds and
+# third-party rigs use `Sync`/`Trigger`/`TTL`. Order matters — first
+# hit wins, so put the user's actual column at the front.
+_SYNC_CANDIDATES = (
+    "A7", "a7",                       # H-Walker firmware (current)
+    "Sync", "sync",                   # generic / older builds
+    "sync_signal", "Sync_Signal",
+    "Trigger", "trigger",
+    "TTL", "ttl",
+)
 
 
 def _find_time_column(df: pd.DataFrame) -> tuple[Optional[str], float]:

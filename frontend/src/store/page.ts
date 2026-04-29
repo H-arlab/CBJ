@@ -616,28 +616,57 @@ export const usePage = create<PageState>()(
       // and stale cells from v2 were auto-firing /api/compute calls
       // on H-Walker datasets that aren't in firmware format
       // (resulting in 409 Conflict spam).
-      version: 3,
+      version: 4,
       migrate: (persisted: unknown, fromVersion: number): Partial<PageState> => {
+        // ?reset=true in the URL forces a clean slate — last-resort
+        // escape hatch for users who hit a corrupt localStorage and
+        // can't reach the Settings drawer.
+        try {
+          if (typeof window !== 'undefined'
+              && new URLSearchParams(window.location.search).get('reset') === 'true') {
+            console.warn('[hw_page] ?reset=true — discarding persisted state');
+            return {};
+          }
+        } catch { /* SSR / no window */ }
+
         if (!persisted || typeof persisted !== 'object') return {};
         try {
           const p = persisted as Record<string, unknown>;
           const safe: Partial<PageState> = {};
-          // From v3 onward we keep cells. Anything older gets a
-          // clean canvas — the user re-clicks what they want from
-          // the Library bookshelf.
-          if (fromVersion >= 3 && Array.isArray(p.cells)) {
-            safe.cells = p.cells as PageState['cells'];
+
+          // Sanitize cells: drop anything that doesn't match the
+          // current schema. Stale shapes (e.g. v2's mock-firing cells,
+          // v3's deprecated 'llm' type) would otherwise crash Cell.tsx
+          // at render and blank the page.
+          const KNOWN_TYPES: ReadonlySet<CellType> = new Set([
+            'graph', 'stat', 'compute', 'inspector',
+          ] as CellType[]);
+          if (fromVersion >= 4 && Array.isArray(p.cells)) {
+            safe.cells = (p.cells as unknown[]).filter((c): c is Cell => {
+              if (!c || typeof c !== 'object') return false;
+              const cell = c as Partial<Cell>;
+              if (typeof cell.id !== 'string' || !cell.id) return false;
+              if (!cell.type || !KNOWN_TYPES.has(cell.type)) return false;
+              if (!Array.isArray(cell.dsIds)) return false;
+              return true;
+            });
           }
-          if (Array.isArray(p.datasets)) safe.datasets = p.datasets as PageState['datasets'];
+          if (Array.isArray(p.datasets)) {
+            safe.datasets = (p.datasets as unknown[]).filter((d): d is Dataset => {
+              if (!d || typeof d !== 'object') return false;
+              const ds = d as Partial<Dataset>;
+              return typeof ds.id === 'string' && ds.id.length > 0;
+            });
+          }
           if (typeof p.currentPreset === 'string') safe.currentPreset = p.currentPreset as PageState['currentPreset'];
           if (typeof p.globalPreset === 'string') safe.globalPreset = p.globalPreset as PageState['globalPreset'];
           if (typeof p.pageTitle === 'string') safe.pageTitle = p.pageTitle as PageState['pageTitle'];
           if (Array.isArray(p.history)) safe.history = p.history as PageState['history'];
-          if (fromVersion < 3) {
+          if (fromVersion < 4) {
             console.info(
-              `[hw_page] migrated persisted state from v${fromVersion} → v3 ` +
-              '(cells cleared — old auto-fire cells were producing 409s on ' +
-              'non-firmware CSVs; pick fresh ones from the Library)',
+              `[hw_page] migrated persisted state from v${fromVersion} → v4 ` +
+              '(unknown cell types and malformed datasets dropped; ' +
+              'append ?reset=true to the URL to start fully fresh)',
             );
           }
           return safe;
