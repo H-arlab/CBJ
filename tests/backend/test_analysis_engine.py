@@ -577,3 +577,132 @@ class TestCacheInvalidation:
             assert "abc123def456" in k_with_id
         finally:
             _REGISTRY.pop(ds_id, None)
+
+
+# ============================================================
+# Stride length — velocity-column alias detection
+#   The H-Walker firmware ships global walking velocity under several
+#   names depending on build (Ax/Ay, Vx/Vy, VelX/VelY, GlobalVelX/Y).
+#   The analyzer must find any of them. Falls back to a scalar-speed
+#   column (`<side>_Vel`) when 2D isn't logged.
+# ============================================================
+
+def _make_stride_length_csv(tmp_path, vx_name="L_Ax", vy_name="L_Ay") -> str:
+    """Build a CSV with one 4 s sync window and a constant 1 m/s
+    walking velocity. With no gyro / no Phase columns, ZUPT detection
+    falls through to all-False (analyzer.py:254), so the integral is
+    just ∫v dt = 1 m/s × 1 s = 1 m per stride. This isolates the
+    alias-resolution path from the ZUPT correction so a column-name
+    regression turns red on its own merits."""
+    fs, dur, stride = 111.0, 6.0, 1.0
+    n = int(dur * fs)
+    t = np.arange(n) / fs
+    df = pd.DataFrame({
+        "Time_ms": t * 1000.0,
+        "Freq_Hz": np.full(n, fs),
+        "Sync": ((t >= 1.0) & (t < 5.0)).astype(float),
+    })
+    for side, off in (("L", 0.0), ("R", stride / 2)):
+        gcp = np.zeros(n); evt = np.zeros(n)
+        act = np.zeros(n); pit = np.zeros(n)
+        vx = np.full(n, 1.0)   # 1 m/s constant — integrates to ~1 m/stride
+        vy = np.zeros(n)
+        for i in range(int(dur / stride)):
+            s = i * stride + off
+            stance_end = s + stride * 0.62
+            idx = int(np.searchsorted(t, s))
+            if idx >= n:
+                continue
+            sm = (t >= s) & (t < stance_end)
+            rm = (t >= s) & (t < s + stride)
+            if sm.any():
+                gcp[sm] = (t[sm] - s) / (stride * 0.62)
+                hump = np.sin(np.pi * (t[sm] - s) / (stride * 0.62)) * 30.0
+                act[sm] = hump
+            if rm.any():
+                pit[rm] = 12.0 * np.sin(2 * np.pi * (t[rm] - s) / stride)
+            evt[idx:idx + 2] = 1.0
+        df[f"{side}_GCP"] = gcp
+        df[f"{side}_Event"] = evt
+        df[f"{side}_DesForce_N"] = act * 1.05
+        df[f"{side}_ActForce_N"] = act
+        df[f"{side}_ErrForce_N"] = act - df[f"{side}_DesForce_N"]
+        df[f"{side}_Pitch_deg"] = pit
+        df[f"{side}{vx_name[1:]}"] = vx
+        df[f"{side}{vy_name[1:]}"] = vy
+        # Intentionally NO gyro and NO Phase column — keeps the ZUPT
+        # detector neutral so the test assertions only depend on
+        # alias resolution + integration, not on ZUPT correctness.
+    path = str(tmp_path / "Robot_stride_length.csv")
+    df.to_csv(path, index=False)
+    return path
+
+
+class TestStrideLengthVelocityAliases:
+    @pytest.mark.parametrize("vx,vy", [
+        ("L_Ax", "L_Ay"),
+        ("L_Vx", "L_Vy"),
+        ("L_VelX", "L_VelY"),
+        ("L_GlobalVelX", "L_GlobalVelY"),
+    ])
+    def test_each_alias_yields_nonzero_stride_length(self, tmp_path, vx, vy):
+        path = _make_stride_length_csv(tmp_path, vx_name=vx, vy_name=vy)
+        res = run_full_analysis(path, window_idx=0)
+        lengths = res.left_stride.stride_lengths
+        finite = lengths[np.isfinite(lengths)]
+        assert finite.size >= 1, (
+            f"alias ({vx},{vy}) — no stride lengths produced"
+        )
+        # 1 m/s × ~1 s = ~1 m per stride. Loose bounds for ZUPT noise.
+        assert 0.6 < float(np.mean(finite)) < 1.4, (
+            f"mean stride length {np.mean(finite):.3f} m off expected ~1 m"
+        )
+
+    def test_scalar_speed_fallback(self, tmp_path):
+        """When no 2D velocity columns exist but a scalar `<side>_Vel`
+        does, integrate that instead. Scalar path doesn't use ZUPT —
+        just sums |v| over each [HS_i, HS_{i+1}] window."""
+        fs, dur, stride = 111.0, 6.0, 1.0
+        n = int(dur * fs)
+        t = np.arange(n) / fs
+        df = pd.DataFrame({
+            "Time_ms": t * 1000.0,
+            "Freq_Hz": np.full(n, fs),
+            "Sync": ((t >= 1.0) & (t < 5.0)).astype(float),
+        })
+        for side, off in (("L", 0.0), ("R", stride / 2)):
+            gcp = np.zeros(n); evt = np.zeros(n)
+            des = np.zeros(n); act = np.zeros(n); pit = np.zeros(n)
+            speed = np.zeros(n)
+            for i in range(int(dur / stride)):
+                s = i * stride + off
+                stance_end = s + stride * 0.62
+                idx = int(np.searchsorted(t, s))
+                if idx >= n:
+                    continue
+                sm = (t >= s) & (t < stance_end)
+                rm = (t >= s) & (t < s + stride)
+                if sm.any():
+                    gcp[sm] = (t[sm] - s) / (stride * 0.62)
+                    hump = np.sin(np.pi * (t[sm] - s) / (stride * 0.62)) * 30.0
+                    act[sm] = hump
+                    des[sm] = hump * 1.05
+                if rm.any():
+                    speed[rm] = 1.0   # 1 m/s scalar magnitude
+                    pit[rm] = 12.0 * np.sin(2 * np.pi * (t[rm] - s) / stride)
+                evt[idx:idx + 2] = 1.0
+            df[f"{side}_GCP"] = gcp
+            df[f"{side}_Event"] = evt
+            df[f"{side}_DesForce_N"] = des
+            df[f"{side}_ActForce_N"] = act
+            df[f"{side}_ErrForce_N"] = act - des
+            df[f"{side}_Pitch_deg"] = pit
+            df[f"{side}_Vel"] = speed   # scalar speed, no 2D
+        path = str(tmp_path / "Robot_scalar_speed.csv")
+        df.to_csv(path, index=False)
+        res = run_full_analysis(path, window_idx=0)
+        lengths = res.left_stride.stride_lengths
+        finite = lengths[np.isfinite(lengths)]
+        assert finite.size >= 1
+        # Scalar integration: ∫|v| dt over 1 s at v=1 → ~1 m
+        assert 0.6 < float(np.mean(finite)) < 1.4

@@ -159,7 +159,8 @@ LIBRARY_GRAPH_TEMPLATES = [
     "force", "force_avg", "force_lr_subplot", "asymmetry",
     "force_tracking_L", "force_tracking_R",
     "trials", "imu_avg", "cyclogram", "rom_bar",
-    "stride_time_trend", "stance_swing_bar", "symmetry_radar",
+    "stride_time_trend", "stride_length_trend",
+    "stance_swing_bar", "symmetry_radar",
 ]
 
 

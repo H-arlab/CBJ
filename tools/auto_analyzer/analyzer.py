@@ -254,14 +254,78 @@ def _detect_midstance_zupt(df: pd.DataFrame, side: str,
     return np.zeros(n, dtype=bool)
 
 
+def _resolve_velocity_columns(df: pd.DataFrame, side: str) -> tuple[Optional[str], Optional[str]]:
+    """Find this side's 2D global-velocity columns in the DataFrame.
+
+    H-Walker / EBIMU firmware ships global-frame walking velocity under
+    several names depending on firmware build. We try each in order:
+
+      1. `<side>_Ax` / `<side>_Ay`            EBIMU soa5 (mislabelled
+                                              accel — actually velocity)
+      2. `<side>_Vx` / `<side>_Vy`            generic 2-axis vel
+      3. `<side>_VelX` / `<side>_VelY`        explicit naming
+      4. `<side>_GlobalVelX` / `<side>_GlobalVelY`  fully-qualified
+
+    If only a scalar speed `<side>_Vel` is present we fall back to that
+    in `_compute_stride_length_from_speed`. Returns (vx_col, vy_col) or
+    (None, None) when no candidate set is complete.
+    """
+    candidates = [
+        (f"{side}_Ax", f"{side}_Ay"),
+        (f"{side}_Vx", f"{side}_Vy"),
+        (f"{side}_VelX", f"{side}_VelY"),
+        (f"{side}_GlobalVelX", f"{side}_GlobalVelY"),
+        (f"{side}_globalVelX", f"{side}_globalVelY"),
+    ]
+    for vx, vy in candidates:
+        if vx in df.columns and vy in df.columns:
+            return vx, vy
+    return None, None
+
+
+def _compute_stride_length_from_speed(df: pd.DataFrame, side: str,
+                                       hs_indices: np.ndarray,
+                                       valid_mask: np.ndarray,
+                                       sample_rate: float) -> np.ndarray:
+    """Per-stride length from a scalar walking-speed column.
+
+    When the firmware emits only `<side>_Vel` (m/s, magnitude), the
+    integral of |v| over one stride window is the path length. This is
+    less accurate than ZUPT-corrected 2D integration (it can't tell
+    sideways vs forward motion) but it's what we get when the IMU
+    rig only logs scalar speed.
+    """
+    speed_col = next((c for c in (f"{side}_Vel", f"{side}_Speed",
+                                   f"{side}_walking_speed_mps")
+                      if c in df.columns), None)
+    if speed_col is None:
+        return np.array([])
+    v = df[speed_col].to_numpy(dtype=np.float64)
+    dt = 1.0 / sample_rate
+    out: list[float] = []
+    for i in range(len(valid_mask)):
+        if not valid_mask[i]:
+            out.append(np.nan)
+            continue
+        s, e = hs_indices[i], hs_indices[i + 1]
+        if e - s < 10:
+            out.append(np.nan)
+            continue
+        seg = v[s:e]
+        seg = seg[np.isfinite(seg)]
+        out.append(float(np.sum(np.abs(seg)) * dt) if seg.size else np.nan)
+    return np.asarray(out)
+
+
 def _compute_stride_length_zupt(df: pd.DataFrame, side: str,
                                  hs_indices: np.ndarray, valid_mask: np.ndarray,
                                  sample_rate: float) -> np.ndarray:
     """
     Compute stride length using ZUPT (Zero Velocity Update).
 
-    EBIMU soa5 configuration: L_Ax/L_Ay columns contain Global Velocity (m/s).
-    Single integration: velocity → displacement.
+    Reads global-frame walking velocity from whichever pair of columns
+    the firmware exposes (see `_resolve_velocity_columns` for the
+    accepted aliases). Single integration: velocity → displacement.
 
     ZUPT method (from MATLAB reference):
     - Accumulate velocity_error_offset during mid-stance (gyro mag < threshold)
@@ -269,12 +333,18 @@ def _compute_stride_length_zupt(df: pd.DataFrame, side: str,
     - NOT hard-zeroing (which creates discontinuities)
 
     Stride length = norm of horizontal displacement between consecutive heel strikes.
-    """
-    vx_col = f'{side}_Ax'
-    vy_col = f'{side}_Ay'
 
-    if not _has_columns(df, [vx_col, vy_col]):
-        return np.array([])
+    If 2D columns aren't available, falls back to scalar-speed
+    integration via `_compute_stride_length_from_speed` (less precise
+    but works on a `<side>_Vel` magnitude channel).
+    """
+    vx_col, vy_col = _resolve_velocity_columns(df, side)
+    if vx_col is None or vy_col is None:
+        # Scalar-speed fallback when 2D global-velocity columns aren't
+        # logged. Some H-Walker builds only emit `<side>_Vel`.
+        return _compute_stride_length_from_speed(
+            df, side, hs_indices, valid_mask, sample_rate,
+        )
 
     vx_full = df[vx_col].values.astype(np.float64)
     vy_full = df[vy_col].values.astype(np.float64)

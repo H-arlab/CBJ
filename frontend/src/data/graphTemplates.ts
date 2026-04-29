@@ -94,6 +94,17 @@ export const GRAPH_TPLS: Record<string, GraphTemplate> = {
     yUnit: 'Stride T (s)', xUnit: 'Stride #',
     yTicks: ['1.20', '1.10', '1.00', '0.90', '0.80'], xTicks: ['1', '5', '10', '15', '20'],
   },
+  // Spatial counterpart of stride_time_trend. Stride length comes
+  // from ZUPT-corrected integration of the firmware's global-velocity
+  // columns (L_Ax/L_Ay or any of the aliases the analyzer accepts)
+  // over each [HS_i, HS_{i+1}] window. The trend fit shows whether
+  // step length is drifting across the trial — useful for fatigue.
+  stride_length_trend: {
+    ey: 'Spatial · stride length over time',
+    title: 'Stride length across strides',
+    yUnit: 'Stride length (m)', xUnit: 'Stride #',
+    yTicks: ['1.40', '1.20', '1.00', '0.80', '0.60'], xTicks: ['1', '5', '10', '15', '20'],
+  },
   stance_swing_bar: {
     ey: 'Temporal phases', title: 'Stance / swing percentages',
     yUnit: '% gait cycle', xUnit: '',

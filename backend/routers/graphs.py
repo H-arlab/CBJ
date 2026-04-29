@@ -72,7 +72,7 @@ REAL_DATA_TEMPLATES = {
     "force", "force_avg", "force_lr_subplot", "asymmetry", "trials",
     "force_tracking_L", "force_tracking_R",
     # Motion / kinematic
-    "imu_avg", "cyclogram", "stride_time_trend",
+    "imu_avg", "cyclogram", "stride_time_trend", "stride_length_trend",
     "stance_swing_bar", "rom_bar", "symmetry_radar",
 }
 
@@ -586,6 +586,48 @@ def _render_real_data(req: RenderRequest) -> tuple[bytes, str] | None:
         return render_from_traces(
             traces, title=req.title or "",
             x_label="Stride #", y_label="Stride time (s)",
+            preset=req.preset, variant=req.variant, format=req.format,
+            dpi=req.dpi, colorblind_safe=req.colorblind_safe, legend=True,
+        )
+
+    if req.template == "stride_length_trend":
+        # Per-stride length (m) across stride # + linear-regression
+        # fit. Length values come from the analyzer's ZUPT integration
+        # of global velocity (or the scalar-speed fallback). NaN
+        # entries — the analyzer flags strides where integration was
+        # unreliable — are dropped before plotting so the trend line
+        # isn't dragged by missing data.
+        ls, rs = res.left_stride, res.right_stride
+        for lengths, label, color in [
+            (ls.stride_lengths, "L", "#3B82C4"),
+            (rs.stride_lengths, "R", "#D35454"),
+        ]:
+            if lengths is None or len(lengths) == 0:
+                continue
+            arr = _np.asarray(lengths, dtype=float)
+            mask = _np.isfinite(arr)
+            if mask.sum() < 2:
+                continue
+            xs_all = _np.arange(1, len(arr) + 1)
+            xs = xs_all[mask]
+            ys = arr[mask]
+            traces.append(Trace(kind="scatter", name=f"{label} strides",
+                                x=list(xs), y=list(ys),
+                                color=color, width=2.0, opacity=0.7))
+            if mask.sum() >= 3:
+                coef = _np.polyfit(xs, ys, 1)
+                fit_y = list(_np.polyval(coef, xs))
+                traces.append(Trace(
+                    kind="line",
+                    name=f"{label} trend ({coef[0]*100:+.2f} cm/stride)",
+                    x=list(xs), y=fit_y,
+                    color=color, width=1.2, dash=True,
+                ))
+        if not traces:
+            return None
+        return render_from_traces(
+            traces, title=req.title or "",
+            x_label="Stride #", y_label="Stride length (m)",
             preset=req.preset, variant=req.variant, format=req.format,
             dpi=req.dpi, colorblind_safe=req.colorblind_safe, legend=True,
         )
