@@ -1,0 +1,50 @@
+# Claude Code 가 읽지 않을 경로 — 토큰 절약용
+# (이미 .gitignore 에 있어도 Claude Code 의 자동 컨텍스트 로딩은 별개)
+
+# 의존성 / 빌드 산출물
+node_modules/
+frontend/dist/
+frontend/node_modules/
+**/__pycache__/
+**/*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# Lockfile (거대하고 거의 안 읽음)
+frontend/package-lock.json
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# 폰트 / 바이너리 / 이미지 (Pretendard 19개 + icns)
+frontend/public/fonts/
+design/fonts/
+AppIcon.icns
+*.icns
+*.ttf
+*.otf
+*.woff
+*.woff2
+design/preview/
+design/assets/
+
+# 옛 디자인 / 레거시 (참고용만)
+frontend/src.legacy/
+design/phase1/
+design/ui_kits/
+
+# 벤더링된 분석 툴 (수정 안 함)
+tools/auto_analyzer/
+tools/graph_analyzer/
+
+# 로그 / 캐시
+*.log
+.cache/
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.bak
